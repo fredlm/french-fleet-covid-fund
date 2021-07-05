@@ -1,0 +1,1882 @@
+---
+title: "Sustainable objectives and commitments deceived by fisheries subsidies for ‘temporary cessations’ in times of COVID"
+subtitle: "Annotated script"
+date: "05 July 2021."
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r, include = FALSE, message = FALSE}
+source("Scripts/Functions/Load packages.R") #Load packages
+source("Scripts/Others/Plot themes.R") #Load themes for figures
+```
+
+# Introduction
+
+This RMarkdown document consists in the detailed and annotated R script that support the findings reported in the manuscript "Sustainable objectives and commitments deceived by fisheries subsidies in times of COVID" submitted to Marine Policy. After the review process and if the manuscript is accepted, this document as well as the files attached to it will be made available via a Git-Hub repository.
+
+# Material and Methods
+
+As described in the manuscript, two sets of data were used in this analysis: 
+
+1. The list of beneficiaries of the European Maritime and Fisheries Fund (EMFF); and 
+2. The European fleet register. 
+
+Below, we provide details on how each set was cleaned, completed, and prepared for our analysis.
+
+## The European Maritime and Fisheries Fund (EMFF)
+
+The list of French EMFF beneficiaries was downloaded at: https://www.europe-en-france.gouv.fr/fr/ressources/liste-des-operations-du-programme-national-feamp-2014-2020 and loaded:
+
+```{r, message = FALSE}
+emff <- read_excel("Data/Raw/liste_des_beneficiaires_20201206.xlsx", sheet = 3) #Load France's EMFF data
+```
+
+### Cleaning EMFF records
+
+It was then cleaned before it could be processed. We first selected and renamed the columns of interest:
+
+```{r}
+emff <- emff %>%
+  row_to_names(row_number = 5) %>% #Use row 5 to rename columns
+  select(axis_code = `Dénomination de la priorité de l'union`, #Select and rename columns of interest
+         measure_code = `Code mesure`,
+         measure = `Libellé mesure`,
+         action_code = `Code sous-\nmesure`,
+         action = `Libellé sous-mesure`,
+         beneficiary_type = `Code nature bénéficiaire ( P / M )`,
+         beneficiary = `Dénomination sociale`,
+         project_number = `Numéro de dossier initial`,
+         cfr_old = `Numéro de navire`,
+         project_name = `Intitulé de l'opération`,
+         date = `Date prévisionnelle début d'opération`,
+         status = `Libellé état du dossier`,
+         subsidy_europe = `Montant EJ FEAMP \n\"part contrepartie\"`,
+         subsidy_national = `Montant EJ \n\"part principale\"`)
+```
+
+And then modified (i.e. fixed or cleaned) a number of columns:
+
+```{r}
+emff <- emff %>%
+  mutate_at(vars(matches(c("subsidy_europe", "subsidy_national"))), ~as.numeric(.)) %>%
+  mutate(cfr_old = str_to_upper(cfr_old), #CFRs to upper case for cleaning
+         cfr_old = gsub(" ", "", cfr_old), #Remove spaces in CFRs
+         date = ifelse(date == "#VALEURMULTI", NA, date), #Remove unknown dates
+         date = dmy(date),
+         date = as.Date(ifelse(year(date) < 2000, date + years(100), date), origin = lubridate::origin)) #Fix incorrect dates
+```
+
+We then proceeded with cleaning CFRs, so they could be matched with the European register:
+
+```{r}
+emff <- emff %>%
+  #Set aside records with no CFRs
+  filter(is.na(cfr_old)) %>% 
+  #Deal with records with CFRs
+  bind_rows(emff %>%
+              filter(!is.na(cfr_old)) %>%
+              mutate(cfr = ifelse(grepl("\\FRA000[0-9]{6}", cfr_old), cfr_old, NA))) #Extract clean CFRs
+emff <- emff %>%
+  #Set aside records with no CFRs or clean CFRs
+  filter(is.na(cfr_old) | !is.na(cfr)) %>% 
+  #Deal with remaining records (i.e. CFRs that need to be cleaned)
+  bind_rows(emff %>%
+              filter(!is.na(cfr_old) & is.na(cfr)) %>%
+              mutate(cfr_old = str_replace(cfr_old, "^([:alpha:]{2,4})?(0{1,3})?([0-9]{2})([:alpha:]{1})?([0-9]{4})([:alpha:]{1,2})?$", "FRA000\\3\\5"),
+                     cfr_old = ifelse(project_number == "PFEA310019CR0910004", "FRA000401420", #Immatriculation in project_name
+                                      ifelse(project_number == "PFEA310019CR0310004", "FRA000924689", cfr_old)), #http://www.fao.org/figis/vrmf/finder/EU/!/display/vessel/UID/030271047
+                     cfr = ifelse(grepl("\\FRA000[0-9]{6}", cfr_old), cfr_old, NA))) #Extract and clean CFRs
+```
+
+We then added some extra information. First, we classified as 'shore fishing' records whose `project_name` contained `PAP` (i.e. `pêche à pied`, or French for `shore fishing`):
+
+```{r}
+emff <- emff %>%
+  mutate(cfr = ifelse(grepl("\\ PAP ", project_name), "Shore fishing", cfr)) %>% #"PAP" = "Pêche à pied" = 'shore fishing' in French
+  select(-cfr_old) %>%
+  replace_na(list(cfr = "-"))
+```
+
+Then removed empty records:
+
+```{r}
+emff <- emff %>%
+  filter(!(is.na(subsidy_europe) & !is.na(subsidy_national)) & !(subsidy_europe == 0 & subsidy_national == 0))
+```
+
+And classified records as 'COVID fund' or not (i.e. `Other funds`): 
+
+```{r}
+emff <- emff %>%
+  mutate(covid_fund = ifelse(str_detect(project_name, fixed("covid", ignore_case = TRUE)), "COVID fund", "Other funds"),
+         subsidy_total = subsidy_europe + subsidy_national) %>%
+  replace_na(list(covid_fund = "Other funds"))
+```
+
+### Dealing with duplicates
+
+These data contained a number of duplicates:
+
+```{r, echo = FALSE}
+options(knitr.kable.NA = "")
+emff %>%
+  group_by(project_number) %>%
+  mutate(count = n()) %>%
+  filter(count > 1) %>%
+  arrange(project_number) %>%
+  select(-count) %>%
+  select(project_number, status) %>%
+  rename(Project = project_number,
+         Status = status) %>%
+  kbl() %>%
+  kable_paper(full_width = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "responsive", "hover")) %>%
+  row_spec(0, bold = TRUE)
+```
+
+As seen in the table above, it appears that for all these duplicates, one record is identified as 'Soldé', i.e. 'Settled'. We considered that these records were the correct ones and therefore removed the other ones from our dataset:
+
+```{r, message = FALSE}
+emff <- emff %>%
+  anti_join(emff %>% #Remove duplicates from dataset
+              group_by(project_number) %>%
+              mutate(count = n()) %>%
+              filter(count > 1) %>%
+              arrange(project_number) %>%
+              select(-count)) %>%
+  bind_rows(emff %>% #Add settled records back in
+              group_by(project_number) %>% 
+              mutate(count = n()) %>%
+              filter(count > 1) %>%
+              arrange(project_number) %>%
+              select(-count) %>%
+              filter(status == "Soldé"))
+```
+
+### Adding missing CFRs
+
+Out of the `r format(nrow(emff), big.mark = ",")` operations retained for our analysis, `r format(nrow(emff %>% filter(covid_fund == "COVID fund")), big.mark = ",")` corresponded to the COVID fund. Out of those, CFRs were not available for `r format(nrow(emff %>% filter(covid_fund == "COVID fund" & cfr == "-")), big.mark = ",")`, i.e. `r round((nrow(emff %>% filter(covid_fund == "COVID fund" & cfr == "-")) / nrow(emff %>% filter(covid_fund == "COVID fund"))) * 100, 1)` % of the records and `r round((emff %>% filter(covid_fund == "COVID fund" & cfr == "-") %>% summarize(subsidy_total = sum(subsidy_total)) / emff %>% filter(covid_fund == "COVID fund") %>% summarize(subsidy_total = sum(subsidy_total))) * 100, 1)` % of the amount. Thanks to the information provided in the column `beneficiary`, we were able to reconstruct a number of CFRs so as to strengthen our analyses and reduce the percentage of unknown vessels. To do so, we first extracted the list of beneficiaries and project numbers for which there were no CFRs, and saved it:
+
+```{r}
+write.xlsx(emff %>%
+  filter(covid_fund == "COVID fund" & cfr == "-" & !is.na(beneficiary)) %>%
+  select(beneficiary, project_number) %>%
+  distinct(), 
+  "Output/Data/List of projects with no CFR - To be cleaned.xlsx")
+```
+
+This list was manually cleaned and then loaded back and merged with the clean EMFF records:
+
+```{r, message = FALSE}
+emff <- emff %>% 
+  #Set aside records that already have a CFR, or no CFR and no beneficiary, or funds other than COVID fund
+  filter(covid_fund == "Other funds" | (!cfr == "-" | is.na(beneficiary))) %>%
+  #Add info for COVID fund records that have no CFR but a beneficiary name
+  bind_rows(emff %>%
+              filter(covid_fund == "COVID fund" & cfr == "-" & !is.na(beneficiary)) %>%
+              select(-cfr) %>%
+              left_join(read_excel("Data/Processed/List of projects with no CFR.xlsx", sheet = 1) %>% #Load manually complemented CFRs
+                          select(-comment, -source), #Keep these two columns if you want to see comments and sources that justify the new CFRs
+                        by = c("beneficiary", "project_number"))) 
+```
+
+As a result of this last step, the number of records with no CFR was reduced to `r format(nrow(emff %>% filter(covid_fund == "COVID fund" & cfr == "-")), big.mark = ",")`, i.e. `r round((nrow(emff %>% filter(covid_fund == "COVID fund" & cfr == "-")) / nrow(emff %>% filter(covid_fund == "COVID fund"))) * 100, 1)` % of the records and `r round((emff %>% filter(covid_fund == "COVID fund" & cfr == "-") %>% summarize(subsidy_total = sum(subsidy_total)) / emff %>% filter(covid_fund == "COVID fund") %>% summarize(subsidy_total = sum(subsidy_total))) * 100, 1)` % of the amount.
+
+## The European fleet register
+
+The EU fleet register (<https://webgate.ec.europa.eu/fleet-europa/search_en)> --- which contains all historical records relating to fishing vessels flagged in EU Member States --- was downloaded on 13 January 2021 with the following filters: 
+
+- Country: 'FRA'  
+- Period: 'All vessels'  
+- Search data context: 'Search data in the whole history of the vessels'
+
+The resulting file, which will be processed below, was loaded:
+
+```{r}
+fleet <- read.csv2("Data/Raw/vesselRegistryListResults.csv", quote = "", stringsAsFactors = FALSE) #Load raw data from EU website
+```
+
+### Cleaning the records
+
+We then proceeded with cleaning and completing the data. First, we selected and renamed the columns of interest:
+
+```{r}
+fleet <- fleet %>%
+  select(cfr = CFR, #Rename columns
+         vessel_name = Name.of.vessel,
+         reg_port = Place.of.registration,
+         event_start_date = Event.Start.Date,
+         event_end_date = Event.End.Date, 
+         gear_code = Main.fishing.gear, 
+         length = LOA,
+         tonnage = Tonnage.GT,
+         Power.of.main.engine,
+         Power.of.auxiliary.engine)
+```
+
+And then modified (i.e. fixed or cleaned) a number of columns:
+
+```{r}
+fleet <- fleet %>%
+  mutate_at(vars(matches(c("length", "tonnage", "Power.of.main.engine", "Power.of.auxiliary.engine"))), ~as.numeric(.)) %>% #Convert as numeric
+  mutate(vessel_name = str_to_upper(vessel_name), #Capitalize vessel_name
+         event_start_date = as.Date(event_start_date, origin = "1899-12-30"), #Make dates actual dates
+         event_end_date = ifelse(event_end_date == "2100-12-31", "2021-01-13", event_end_date), #Replace last records by download date
+         event_end_date = as.Date(event_end_date, origin = "1899-12-30"), #Make dates actual dates
+         power = Power.of.main.engine + Power.of.auxiliary.engine) %>% #Combine main and auxiliary power
+  select(-Power.of.main.engine, -Power.of.auxiliary.engine) %>%
+  replace_na(list(reg_port = "NA")) #`reg_port`= NA corresponds to the port of Nantes, not an NA record
+```
+
+We then added the names, types, and categories of fishing gears based on `gear_code`:
+
+```{r}
+fleet <- fleet %>%
+  left_join(read_excel("Data/Processed/Gear codes.xlsx"), #Load fishing gear codes to clean register
+            by = "gear_code") %>%
+  select(vessel_name, reg_port, cfr, gear, gear_cat, gear_type, event_start_date, event_end_date, length, tonnage, power) #Select columns of interest
+```
+
+### Simplifying the records
+
+We then only kept continuous records to facilitate processing later on:
+
+```{r}
+fleet <- setDT(fleet)
+fleet <- fleet[,.(event_start_date = min(event_start_date),
+          event_end_date = max(event_end_date)) ,
+       by = .(rleid(cfr, vessel_name, reg_port, length, tonnage, power, gear, gear_cat, gear_type),
+            cfr,
+            vessel_name,
+            reg_port,
+            length,
+            tonnage,
+            power,
+            gear,
+            gear_cat,
+            gear_type)] %>%
+  select(-rleid)
+```
+
+### Categorizing information
+
+We created two columns:
+
+1. A `last_event` column, with either a `TRUE` ('last event') or `FALSE` ('older event') value;
+2. A `covid_fund_period_overlap` column, with either a `TRUE` ('overlapping the COVID fund period') or `FALSE` ('not overlapping') value:
+
+```{r}
+fleet <- fleet %>%
+  group_by(cfr) %>%
+  arrange(desc(event_start_date)) %>%
+  mutate(last_event = as.logical(row_number() == 1)) %>%
+  ungroup() %>%
+  mutate(covid_fund_period_overlap = int_overlaps(interval(event_start_date, event_end_date), interval(ymd("2020-03-12"), ymd("2020-05-31"))))
+```
+
+### Creating length, tonnage, and power classes
+
+We then extracted the fleet that was active during the period covered by the COVID fund:
+
+```{r}
+covid_fleet <- fleet %>%
+  filter(covid_fund_period_overlap == TRUE) %>%
+  group_by(cfr) %>%
+  arrange(cfr, desc(event_start_date)) %>% #Filter most recent event (i.e. not necessarily a `last_event` == TRUE record...)
+  filter(row_number() == 1) %>%
+  select(-covid_fund_period_overlap) %>%
+  ungroup()
+```
+
+And created length classes based on i) those provided in the COVID fund decree, and ii) the official French classification:
+
+```{r, warning = FALSE}
+covid_fleet <- covid_fleet %>%
+  mutate(class_length = ifelse(length < 10, "<10 m", #The COVID fund decree distinguishes vessels with a length <10 m from those in the 10-12 m class
+                        ifelse(length >=10 & length <12, "10-12 m", #See above
+                               ifelse(length >= 12 & length < 25, "12-25 m", #Official FranceAgriMer classification
+                                      ifelse(length >= 25 & length < 40, "25-40 m", ">40 m")))), #Official FranceAgriMer classification
+         class_length = fct_reorder(class_length, length))
+```
+
+Based on these classes, we also created tonnage and power classes, each class containing a number of records based on `class_length`'s proportions. 
+
+```{r}
+#Calculate quantiles
+quantiles <- covid_fleet %>%
+  group_by(class_length) %>%
+  summarise(class_length = n()) %>%
+  mutate(class_length = cumsum(class_length / nrow(covid_fleet))) %>%
+  select(class_length) %>%
+  add_row(class_length = 0, .before = 1) %>%
+  pull()
+
+#Apply quantiles to tonnage and power
+list <- c("tonnage", "power")
+datalist = list()
+for(i in seq_along(list))
+{
+  df <- covid_fleet %>%
+    select(i = list[i]) %>%
+    mutate(i = quantcut(i, q = quantiles, dig.lab = 5))
+  #Store breaks for later use
+  breaks <- df  %>%
+    distinct() %>%
+    mutate(i = str_split(gsub("[][(]",
+                              "",
+                              i), 
+                         ",")) %>%
+    unnest(cols = c(i)) %>%
+    mutate(i = round(as.numeric(i), 2),
+           i = ifelse(i == min(i), 0, i)) %>%
+    distinct() %>%
+    arrange(i)
+  colnames(breaks)[1] <- paste("break_", list[i], sep = "")
+  colnames(df)[1] <- paste("break_", list[i], sep = "")
+  assign(colnames(df)[1], breaks) #Rename dataframe with breaks
+  datalist[[i]] <- df # add breaks to list
+  rm(breaks, df)
+}
+covid_fleet <- bind_cols(covid_fleet, datalist) #Put data together
+
+#Create proper classes and factorize them
+list <- c("break_tonnage", "break_power")
+datalist = list()
+for(i in seq_along(list))
+{
+  df <- covid_fleet %>%
+    select(i = list[i]) %>%
+    distinct()
+  df <- df %>%
+    mutate(j = ifelse(i == first(levels(i)),
+                      paste("<", 
+                            df %>% 
+                              filter(i == first(levels(i))) %>%
+                              mutate(x = str_sub(i, 2, -2)) %>% 
+                              separate(x, c("min", "max"), sep = ",") %>% 
+                              mutate_at(vars(matches(c("min", "max"))), ~round(as.numeric(.), 0)) %>%
+                              select(max) %>%
+                              pull(), 
+                            sep = ""),
+                      NA))
+  df <- df %>% #Deal with NAs for class_tonnage in data above 
+    filter(!is.na(j)) %>%
+    bind_rows(df %>%
+                filter(is.na(j)) %>%
+                mutate(j = ifelse(i == last(levels(i)), 
+                                  paste(">", 
+                                        df %>% 
+                                          filter(i == last(levels(i))) %>%
+                                          mutate(x = str_sub(i, 2, -2)) %>% 
+                                          separate(x, c("min", "max"), sep = ",") %>% 
+                                          mutate_at(vars(matches(c("min", "max"))), ~round(as.numeric(.), 0)) %>%
+                                          select(min) %>%
+                                          pull(), 
+                                        sep = ""),
+                                  NA)))
+  df <- df %>% #Deal with NAs for class_tonnage in data above 
+    filter(!is.na(j)) %>%
+    bind_rows(df %>%
+                filter(is.na(j)) %>%
+                mutate(j = str_sub(i, 2, -2)) %>% 
+                separate(j, c("min", "max"), sep = ",") %>% 
+                mutate_at(vars(matches(c("min", "max"))), ~round(as.numeric(.), 0)) %>%
+                mutate(j = paste(min, "-", max, sep = "")) %>%
+                select(-min, -max))
+  #Store factors for later use
+  factors <- df %>%
+    arrange(i) %>%
+    mutate(id = 1:n()) %>%
+    select(-i) %>%
+    mutate(j = fct_reorder(j, id))
+  colnames(df)[2] <- list[i]
+  colnames(df)[2] = gsub("break", "class", colnames(df)[2])
+  colnames(factors)[1] <- colnames(df)[2]
+  assign(colnames(df)[2], factors) #Rename dataframe with breaks
+  colnames(df)[1] <- list[i]
+  datalist[[i]] <- df # add classes to list
+  rm(factors, df)
+}
+covid_fleet <- covid_fleet %>% #Put data together
+  left_join(as.data.frame(datalist) %>%
+              select(break_tonnage, class_tonnage),
+            by = "break_tonnage") %>%
+  left_join(as.data.frame(datalist) %>%
+              select(break_power, class_power),
+            by = "break_power") %>%
+  select(-break_tonnage, -break_power) %>%
+  mutate(class_tonnage = paste(class_tonnage, " GT", sep = ""),
+         class_power = paste(class_power, " kW", sep = "")) %>%
+  mutate(class_tonnage = fct_reorder(class_tonnage, tonnage), #Factorize classes
+         class_power = fct_reorder(class_power, power))
+
+#Clean factors for later use
+factors_length <- covid_fleet %>% 
+  select(class_length) %>% 
+  distinct() %>%
+  arrange(class_length) %>%
+  mutate(id = 1:n())
+factors_tonnage <- class_tonnage %>%
+  mutate(class_tonnage = paste(class_tonnage, " GT", sep = ""),
+         class_tonnage = fct_reorder(class_tonnage, id)) 
+factors_power <- class_power %>%
+  mutate(class_power = paste(class_power, " kW", sep = ""),
+         class_power = fct_reorder(class_power, id)) 
+rm(class_power, class_tonnage, datalist, i, list, quantiles)
+```
+
+We then used the same classes for the entire fleet:
+
+```{r}
+fleet <- fleet %>%
+  mutate(id = as.numeric(cut(tonnage, 
+                    breaks = break_tonnage %>% select(break_tonnage) %>% pull())))
+fleet <- fleet %>%
+  filter(!is.na(id)) %>%
+  bind_rows(fleet %>%
+              filter(is.na(id)) %>%
+              mutate(id = ifelse(tonnage == 0, 1,
+                                   ifelse(tonnage > 0, fleet %>%
+                                            filter(!is.na(id)) %>% 
+                                            summarise(id = max(id)) %>% 
+                                            pull(), 
+                                          NA)))) %>%
+  left_join(factors_tonnage, by = "id") %>%
+  select(-id)
+fleet <- fleet %>%
+  mutate(id = as.numeric(cut(power, 
+                    breaks = break_power %>% select(break_power) %>% pull())))
+fleet <- fleet %>%
+  filter(!is.na(id)) %>%
+  bind_rows(fleet %>%
+              filter(is.na(id)) %>%
+              mutate(id = ifelse(power == 0, 1,
+                                   ifelse(power > 0, fleet %>%
+                                            filter(!is.na(id)) %>% 
+                                            summarise(id = max(id)) %>% 
+                                            pull(), 
+                                          NA)))) %>%
+  left_join(factors_power, by = "id") %>%
+  select(-id)
+fleet <- fleet %>%
+  mutate(class_length = ifelse(length < 10, "<10 m", #The COVID fund decree distinguishes vessels with a length <10 m from those in the 10-12 m class
+                        ifelse(length >=10 & length <12, "10-12 m", #See above
+                               ifelse(length >= 12 & length < 25, "12-25 m", #Official FranceAgriMer classification
+                                      ifelse(length >= 25 & length < 40, "25-40 m", ">40 m")))), #Official FranceAgriMer classification
+         class_length = fct_reorder(class_length, length))
+```
+
+As a result, we obtained two files that consisted in:
+
+1. `r format(nrow(fleet), big.mark = ",")` records for the entire fleet;
+2. `r format(nrow(covid_fleet), big.mark = ",")` records for the COVID fleet.
+
+## Combining EMFF data with the European register
+
+### Matching vessels
+
+Before proceeding with matching data, we manually added characteristics for one beneficiary, for which we did not have a CFR, but for which we were able to determine the vessels' characteristics (see `Data/Processed/List of projects with no CFR.xlsx`)
+
+```{r}
+data <- emff %>%
+  filter(!covid_fund == "COVID fund" | !cfr == "-") %>% #Non COVID funds or COVID funds with CFRs
+  bind_rows(emff %>% #Deal with other rows
+              filter(covid_fund == "COVID fund" & cfr == "-") %>% #Select COVID funds records with no CFR
+              left_join(fleet, by = "cfr") %>% #Add columns with vessel characteristics
+              mutate(type = "No CFR",
+                     class_length = ifelse(beneficiary == "SARL ETOILE D'ARVOR", "12-25 m", class_length))) #Manually add characteristics
+```
+
+For the other records, i.e. those with a CFR, we then sequentially matched data from the Register:
+
+#### Matching records with the Register's records corresponding to the most recent entries that overlapped with the COVID fund
+
+```{r}
+data <- data %>%
+  filter(!covid_fund == "COVID fund" | cfr == "-") %>% #Non COVID funds or COVID funds without CFRs
+  bind_rows(data %>% #Deal with COVID funds with CFRs
+              filter(covid_fund == "COVID fund" & !cfr == "-") %>%
+              select(-c(vessel_name:ncol(.))) %>%
+              left_join(fleet %>%  
+                          filter(last_event == TRUE & covid_fund_period_overlap == TRUE),
+                        by = "cfr")) %>%
+  mutate(type = ifelse(!is.na(class_length) & is.na(type), "CFRs that matched the Register's last events, which overlapped with COVID fund", type))
+```
+
+#### Matching remaining records with the Register's records corresponding to older entries that overlapped with the COVID fund
+
+```{r}
+data <- data %>%
+  filter(!covid_fund == "COVID fund" | !(covid_fund == "COVID fund" & !cfr == "-" & is.na(vessel_name))) %>% #Non COVID funds or COVID funds with CFRs that haven't matched yet
+  bind_rows(data %>% #Deal with COVID funds with CFRs that haven't matched yet
+              filter(covid_fund == "COVID fund" & !cfr == "-" & is.na(vessel_name)) %>%
+              select(-c(vessel_name:ncol(.))) %>%
+              left_join(fleet %>%  
+                          filter(last_event == FALSE & covid_fund_period_overlap == TRUE),
+                        by = "cfr")) %>%
+  mutate(type = ifelse(!is.na(class_length) & is.na(type), "CFRs that matched the Register's older events, which overlapped with COVID fund", type))
+```
+
+#### Matching remaining records with the other Register's records, i.e. those that did not overlap with the COVID fund
+
+```{r}
+data <- data %>%
+  filter(!covid_fund == "COVID fund" | !(covid_fund == "COVID fund" & !cfr == "-" & is.na(vessel_name))) %>% #Non COVID funds or COVID funds with CFRs that haven't matched yet
+  bind_rows(data %>% #Deal with COVID funds with CFRs that haven't matched yet
+              filter(covid_fund == "COVID fund" & !cfr == "-" & is.na(vessel_name)) %>%
+              select(-c(vessel_name:ncol(.))) %>%
+              left_join(fleet %>%  
+                          filter(!covid_fund_period_overlap == TRUE),
+                        by = "cfr")) %>%
+  mutate(type = ifelse(!is.na(class_length) & is.na(type), "CFRs that matched Register's events that did not overlap with COVID fund", type))
+```
+
+### Reconstructing characteristics for non-matching vessels
+
+A few vessels still did not match the Register, but several of these vessels had a `beneficiary` name that we used to reconstruct a correct CFR:
+
+```{r, echo = FALSE}
+data %>%
+  filter(covid_fund == "COVID fund" & !cfr == "-" & is.na(vessel_name) & !is.na(beneficiary)) %>%
+  select(beneficiary) %>%
+  rename(Beneficiary = beneficiary) %>%
+  kbl() %>%
+  kable_paper(full_width = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "responsive", "hover")) %>%
+  row_spec(0, bold = TRUE)
+```
+
+* CAP FAGNET is a company that appears to have owned two vessels in the past: SPES and SYMBIOSE (https://lemarin.ouest-france.fr/secteurs-activites/peche/27319-normandie-un-chalutier-surgelateur-passe-sous-pavillon-francais). SPES is still active and given that its CFR, i.e. FRA000716582, is very close to one for CAP FAGNET that did not match, i.e. FRA000716782, we considered the former to be the correct CFR.
+* EUROPECHE is a company that owns vessel SAINT PAUL (CFR is FRA000806962; source: "Le guide de l'armement à la pêche" published by Le Marin). Its registration port, Ouistreham, is consistent for both sources.
+* MAY-LINE is a company whose owner (https://www.societe.com/societe/may-line-832966998.html) possesses vessel LA PETITE MAYLIS (FRA000686467; source: "Le guide de l'armement à la pêche" published by Le Marin).
+
+Note that EUROPECHE and MAY-LINE were both incorrectly recorded by the French administration with the same CFR, i.e. FRA000987567, which also appears to be shared by `r nrow(emff %>% filter(cfr == "FRA000987567" & is.na(beneficiary)))` other vessels whose beneficiary are unknown:
+
+```{r, echo = FALSE}
+data %>%
+  filter(covid_fund == "COVID fund" & cfr == "FRA000987567" & is.na(beneficiary)) %>%
+  select(project_number, cfr) %>%
+  rename(`Project number` = project_number,
+         CFR = cfr) %>%
+    kbl() %>%
+  kable_paper(full_width = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "responsive", "hover")) %>%
+  row_spec(0, bold = TRUE)
+```
+
+Based on the above, we cleaned the records for these three vessels with a known beneficiary, and matched them to the Register:
+
+```{r, message = FALSE}
+data <- data %>%
+  filter(!(beneficiary == "CAP FAGNET" & cfr == "FRA000716782") & !beneficiary %in% c("EUROPECHE", "MAY-LINE")) %>%
+  bind_rows(data %>%
+              filter((beneficiary == "CAP FAGNET" & cfr == "FRA000716782") | beneficiary %in% c("EUROPECHE", "MAY-LINE")) %>%
+              select(-c(vessel_name:ncol(.))) %>%
+              mutate(cfr = ifelse(beneficiary == "CAP FAGNET" & cfr == "FRA000716782", "FRA000716582", #Cleaning CFRs
+                                  ifelse(beneficiary == "EUROPECHE", "FRA000806962", "FRA000686467"))) %>%
+              left_join(fleet %>%  
+                          filter(last_event == TRUE & covid_fund_period_overlap == TRUE),
+                        by = "cfr")) %>%
+  select(-last_event, -event_start_date, -event_end_date) %>% #Remove useless columns
+  mutate(type = ifelse(!is.na(class_length) & is.na(type), "CFRs that matched the Register's last events, which overlapped with COVID fund", 
+                       ifelse(!is.na(cfr) & !cfr == "-" & is.na(class_length), "CFRs that did not match any of the Register's events", type)))
+```
+
+Finally, we created a 'Shore fishing' category for the concerned records:
+
+```{r}
+data <- data %>%
+  mutate(type = ifelse(cfr == "Shore fishing", "Shore fishing", type))
+```
+
+### Cleaning columns
+
+Once the records were matched to the vessels' characteristics, we cleaned a number of columns:
+
+```{r}
+data <- data %>%
+  filter(!covid_fund == "COVID fund") %>%
+  bind_rows(data %>%
+              filter(covid_fund == "COVID fund") %>%
+              mutate_at(vars(matches(c("gear", "gear_cat", "gear_type", "class_length", "class_tonnage", "class_power"))), ~ifelse(type == "No CFR" & is.na(class_length), "No CFR", as.character(.))) %>% #Clean columns when there is no CFR and no vessel characteristics
+              mutate_at(vars(matches(c("gear", "gear_cat", "gear_type", "class_tonnage", "class_power"))), ~ifelse(type == "No CFR" & !is.na(class_length), "No CFR", as.character(.))) %>% #Clean columns when there is no CFR but vessel characteristics
+              mutate_at(vars(matches(c("gear", "gear_cat", "gear_type", "class_length", "class_tonnage", "class_power"))), ~ifelse(type == "CFRs that did not match any of the Register's events", "Unknown vessels", as.character(.))) %>% #Clean columns for unknown vessels
+              mutate_at(vars(matches(c("gear", "gear_cat", "gear_type", "class_length", "class_tonnage", "class_power"))), ~ifelse(type == "Shore fishing", "Shore fishing", as.character(.)))) %>% #Clean columns for shore fishing
+  mutate_at(vars(matches(c("gear", "gear_cat", "gear_type", "class_length", "class_tonnage", "class_power", "type"))), ~ifelse(!covid_fund == "COVID fund", NA, as.character(.))) #Remove any potential information for 'Other funds' (no impact on results; just a way to clean data as these other funds are out of scope)
+
+#Re-factor classes
+factors_length <- factors_length %>%
+  bind_rows(tibble(class_length = c("Unknown vessels", "No CFR", "Shore fishing", NA), #Add missing factors
+            id = c(6:9))) %>%
+  arrange(id)
+factors_tonnage <- factors_tonnage %>%
+  bind_rows(tibble(class_tonnage = c("Unknown vessels", "No CFR", "Shore fishing", NA), #Add missing factors
+            id = c(6:9))) %>%
+  arrange(id)
+factors_power <- factors_power %>%
+  bind_rows(tibble(class_power = c("Unknown vessels", "No CFR", "Shore fishing", NA), #Add missing factors
+            id = c(6:9))) %>%
+  arrange(id)
+
+data <- data %>%
+  mutate(class_length = factor(class_length, 
+                               levels = factors_length %>% 
+                                 select(class_length) %>% 
+                                 distinct() %>%
+                                 pull()),
+         class_tonnage = factor(class_tonnage, 
+                                levels = factors_tonnage %>% 
+                                  select(class_tonnage) %>% 
+                                  distinct() %>%
+                                  pull()),
+         class_power = factor(class_power, 
+                              levels = factors_power %>% 
+                                select(class_power) %>% 
+                                distinct() %>%
+                                pull()))
+```
+
+### Adding major companies/groups
+
+We extracted the list of `project_number`, `beneficiary` and `vessel_name` combinations that accounted for 30 % of the cumulated subsidies, in order to manually assign the companies that own them:
+
+```{r}
+write.xlsx(data %>%
+  filter(covid_fund == "COVID fund") %>%
+  arrange(desc(subsidy_total)) %>%
+  mutate(cum_sum_percent = cumsum(subsidy_total)/sum(subsidy_total)) %>%
+  filter(cum_sum_percent <= 0.3 & (!is.na(beneficiary) | !is.na(vessel_name))) %>%
+  select(project_number, beneficiary, vessel_name, cfr) %>%
+  distinct() %>%
+  mutate(top_30_percent_subsidies = "Yes"), 
+  "Output/Data/Big companies - To be cleaned.xlsx") #Export data
+```
+
+For the `r nrow(read_excel("Data/Processed/Big companies.xlsx") %>% select(vessel_name, cfr, company) %>% filter(!company == "-") %>% select(company) %>% distinct())` companies that were identified in this list, we also manually searched for the complete list of vessels they owned. We merged both files (i.e. the incomplete list and the complete list) with our data in order to assign the concerned vessels to their companies:
+
+```{r}
+data <- data %>%
+  left_join(bind_rows(read_excel("Data/Processed/Big companies.xlsx") %>% #Load clean data
+                        select(vessel_name, cfr, company) %>%
+                        filter(!company == "-"), 
+                      read_excel("Data/Processed/Big companies - Full list.xlsx") %>% #Load clean data
+                        select(vessel_name, cfr, company)) %>%
+              distinct(), 
+            by = c("vessel_name", "cfr"))
+```
+
+```{r, echo = FALSE}
+#Get stats
+all <- round(data %>% 
+               summarise(subsidy_total = sum(subsidy_total) / 10^6) %>%
+               pull(), 
+             1)
+only_covid <- round(data %>% 
+                      filter(covid_fund == "COVID fund") %>% 
+                      summarise(subsidy_total = sum(subsidy_total) / 10^6) %>%
+                      pull(), 
+                    1)
+perc_only_covid <- round(((data %>% 
+                             filter(covid_fund == "COVID fund") %>% 
+                             summarise(subsidy_total = sum(subsidy_total)) / 
+                             data %>% 
+                             summarise(subsidy_total = sum(subsidy_total))) %>%
+                            pull()) * 100, 
+                         1)
+focus <- round(data %>% 
+                 filter(covid_fund == "COVID fund" & 
+                          !(class_length %in% c("No CFR", "Shore fishing", "Unknown vessels", NA))) %>% 
+                 summarise(subsidy_total = sum(subsidy_total) / 10^6) %>%
+                 pull(), 
+               1)
+perc_focus <- round(((data %>% 
+                        filter(covid_fund == "COVID fund" & 
+                                 !(class_length %in% c("No CFR", "Shore fishing", "Unknown vessels", NA))) %>% 
+                        summarise(subsidy_total = sum(subsidy_total)) / 
+                        data %>% 
+                        filter(covid_fund == "COVID fund") %>% 
+                        summarise(subsidy_total = sum(subsidy_total))) %>%
+                       pull()) * 100, 
+                    1)
+```
+
+Overall, France’s list of EMFF beneficiaries amounted to `r format(all, big.mark = ",")` million EUR, out of which `r only_covid` million EUR were from the COVID fund (i.e. `r perc_only_covid` %). In the present analysis, we focus on the `r format(focus, big.mark = ",")` million EUR, i.e. `r perc_focus` % of the COVID fund, for which vessels were correctly linked to the European fleet register (i.e. excluding non-matching or missing CFRs, as well as shore fishing).
+
+# Results
+
+For the following analyses, we only kept data pertaining to the COVID fund, as well as vessels for which we had a gear category (i.e. we excluded unknown vessels as well as shore fishing):
+
+```{r}
+data <- data %>% 
+  filter(covid_fund == "COVID fund" & !(gear_cat %in% c("No CFR", "Unknown vessels", "Shore fishing")))
+```
+
+## The major groups’ jackpot
+
+### Preparing the data
+
+We summarized our data to visualize major companies vs. other beneficiaries:
+
+```{r, message = FALSE}
+totals <- data %>% 
+  mutate(big_companies = ifelse(!is.na(company), "Large companies/groups", "Other beneficiaries")) %>% 
+  group_by(big_companies) %>% 
+  summarise(subsidy_total = sum(subsidy_total), .groups = "keep")
+total_others <- totals %>% 
+  filter(big_companies == "Other beneficiaries") %>%
+  pull()
+total_big_companies <- totals %>% 
+  filter(big_companies == "Large companies/groups") %>%
+  pull()
+total_seven_big_companies <- data %>% 
+  mutate(big_companies = ifelse(!is.na(company), "Large companies/groups", "Other beneficiaries")) %>% 
+  group_by(company, big_companies) %>% 
+  summarise(subsidy_total = sum(subsidy_total), .groups = "keep") %>% 
+  filter(big_companies == "Large companies/groups") %>%
+  arrange(desc(subsidy_total)) %>%
+  ungroup() %>%
+  top_n(7) %>%
+  summarise(subsidy_total = sum(subsidy_total)) %>%
+  pull()
+labels <- data %>% 
+  mutate(big_companies = ifelse(!is.na(company), "Large companies/groups", "Other beneficiaries")) %>% 
+  group_by(company, big_companies) %>% 
+  summarise(subsidy_total = sum(subsidy_total), .groups = "keep") %>% 
+  arrange(subsidy_total) %>% 
+  ungroup() %>% 
+  mutate(id = 1:n(), 
+         company = ifelse(id < 7, NA, as.character(company))) %>% 
+  filter(!is.na(company)) %>%
+  mutate(company = factor(company, levels = unique(.$company)),
+         x = 1) %>%
+  select(-big_companies)
+```
+
+### Plotting the data
+
+```{r, echo = FALSE}
+plot_companies <- data %>% 
+  mutate(x = ifelse(!is.na(company), "Large companies/groups", "Other beneficiaries")) %>% 
+  group_by(company, x) %>% 
+  summarise(subsidy_total = sum(subsidy_total), .groups = "keep") %>% 
+  arrange(subsidy_total) %>% 
+  mutate(x = 1)
+order <- plot_companies %>%
+  ungroup() %>%
+  select(company) %>%
+  filter(!is.na(company)) %>%
+  add_row(company = NA, .before = 1)
+big_companies <- ggplot(data = plot_companies,
+                        aes(x = x,
+                            y = subsidy_total / 10^6,
+                            fill = factor(company, levels = order$company, exclude = NULL))) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_viridis_d(option = "cividis", na.value = "grey80") +
+  plot_theme %+% theme(panel.grid.major.y = element_blank(),
+                       axis.text.x = element_blank(),
+                       axis.ticks.x = element_blank()) +
+  scale_y_continuous(expand = c(0, 0), 
+                     labels = number_format(accuracy = 1, 
+                                            big.mark = " ", 
+                                            decimal.mark = ".")) + 
+  labs(x = NULL, y = "Amount of subsidy (million EUR)") +
+  geom_hline(yintercept = c(total_big_companies, total_seven_big_companies) / 10^6,
+             size = 0.25,
+             linetype = "dashed") +
+  annotate(geom = "text",
+           label = c(paste(round((total_seven_big_companies/(total_others + total_big_companies)) * 100, 1), " %", sep = ""), paste(round((total_big_companies/(total_others + total_big_companies)) * 100, 1), " %", sep = "")),
+           x = 1.5,
+           y = c(0.9 * total_seven_big_companies, 1.1 * total_big_companies) / 10^6,
+           size = 2) +
+  geom_text(data = labels,
+            aes(label = company),
+            size = 2, 
+            position = position_stack(vjust = 0.5))
+ggsave(big_companies, file = "Output/Figures/Big companies.png", width = 87, height = 87, unit = "mm")
+big_companies
+```
+
+### Summarizing the data
+
+We show that the `r nrow(data %>% select(company) %>% filter(!is.na(company)) %>% distinct())` companies that we identified received `r round((total_big_companies/(total_others + total_big_companies)) * 100, 1)` % of all allocated subsidies. Among these 13 companies, seven of them accounted for most subsidies, and overall accounted for `r round((total_seven_big_companies/(total_others + total_big_companies)) * 100, 1)` % of all allocated subsidies.
+
+```{r, echo = FALSE, message = FALSE}
+data %>%
+  ungroup() %>%
+  filter(!is.na(company)) %>%
+  group_by(company, gear) %>%
+  summarise(`Number of subsidized vessels` = n_distinct(vessel_name),
+            `Amount of subsidies received (million EUR)` = round(sum(subsidy_total), 0),
+            min_length = min(length), 
+            max_length = max(length)) %>%
+  mutate(Gears = paste(gear, collapse = ", ")) %>% #Create sequences
+  ungroup() %>%
+  group_by(company, Gears) %>%
+  summarise(`Number of subsidized vessels` = sum(`Number of subsidized vessels`),
+            `Amount of subsidies received (million EUR)` = sum(`Amount of subsidies received (million EUR)`),
+            min_length = min(min_length), 
+            max_length = max(max_length)) %>%
+  arrange(desc(`Amount of subsidies received (million EUR)`)) %>%
+  ungroup() %>%
+  slice(1:7) %>%
+  mutate(`Amount of subsidies received (million EUR)` = format(`Amount of subsidies received (million EUR)`, big.mark = " "),
+         `Vessel length` = ifelse(round(min_length, 1) == round(max_length, 1), round(min_length, 1), paste(round(min_length, 1), round(max_length, 1), sep = "-"))) %>%
+  select(-min_length, -max_length) %>%
+  rename(Company = company) %>%
+  kbl() %>%
+  kable_paper(full_width = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "responsive", "hover")) %>%
+  row_spec(0, bold = TRUE)
+```
+
+The `r data %>% ungroup() %>% filter(!is.na(company)) %>% group_by(company) %>% summarise(number_vessels = n_distinct(vessel_name), subsidy_total = round(sum(subsidy_total), 0)) %>% arrange(desc(subsidy_total)) %>% top_n(7) %>% summarise(number_vessels = sum(number_vessels)) %>% pull()` vessels owned by these seven companies account for `r round((data %>% ungroup() %>% filter(!is.na(company)) %>% group_by(company) %>% summarise(number_vessels = n_distinct(vessel_name), subsidy_total = round(sum(subsidy_total), 0)) %>% arrange(desc(subsidy_total)) %>% top_n(7) %>% summarise(number_vessels = sum(number_vessels)) %>% pull() / nrow(covid_fleet)) * 100, 1)` % of the French fleet.
+
+## Most subsidies benefited larger vessels and higher-impact fishing methods
+
+### Preparing the data
+
+We first calculated the proportion of subsidies allocated to each gear and length class, in terms of i) number of files processed, total length/tonnage/power of the vessels, and total value of the subsidies received:
+
+```{r}
+#Create function to calculate proportions
+proportions_by_class <- function(data){
+  df <- data %>%
+    summarise(subsidies_number = n(),
+              subsidies_length = sum(length),
+              subsidies_tonnage = sum(tonnage),
+              subsidies_power = sum(power),
+              subsidies_value = sum(subsidy_total),
+              .groups = "keep") %>%
+    ungroup() %>%
+    mutate(subsidies_number_percent = subsidies_number/sum(subsidies_number),
+           subsidies_length_percent = subsidies_length/sum(subsidies_length),
+           subsidies_tonnage_percent = subsidies_tonnage/sum(subsidies_tonnage),
+           subsidies_power_percent = subsidies_power/sum(subsidies_power),
+           subsidies_value_percent = subsidies_value/sum(subsidies_value))
+}
+#Apply function
+funding_vs_fleet_gear_for_table <- funding_vs_fleet_gear <- proportions_by_class(data %>%
+                                                                                   group_by(gear_cat, gear_type)) %>%
+  rename(category = gear_cat,
+         category_group = gear_type)
+funding_vs_fleet_class_length_for_table <- funding_vs_fleet_class_length <- proportions_by_class(data %>%
+                                                                                                   group_by(class_length)) %>%
+  mutate(category_group = NA) %>% #Create empty group for function below
+  rename(category = class_length)
+```
+
+We then matched these proportions to those of the actual fleet, pivoted the data into longer format, and prepared the data for plotting. The first step was to summarise the COVID fleet in terms of gear and length class:
+
+```{r}
+#Create function to summarise COVID fleet
+summarise_fleet <- function(data){
+  data %>%
+    summarise(fleet_number = n(),
+              fleet_length = sum(length),
+              fleet_tonnage = sum(tonnage),
+              fleet_power = sum(power),
+              .groups = "keep") %>%
+    ungroup() %>%
+    mutate(fleet_number_percent = fleet_number/sum(fleet_number),
+           fleet_length_percent = fleet_length/sum(fleet_length),
+           fleet_tonnage_percent = fleet_tonnage/sum(fleet_tonnage),
+           fleet_power_percent = fleet_power/sum(fleet_power))
+}
+#Apply function
+covid_fleet_gear <- summarise_fleet(covid_fleet %>%
+                                      group_by(gear_cat, gear_type)) %>%
+  rename(category = gear_cat,
+         category_group = gear_type)
+covid_fleet_class_length <- summarise_fleet(covid_fleet %>%
+                                              group_by(class_length)) %>%
+  mutate(category_group = NA) %>% #Create empty group for function below
+  rename(category = class_length)
+```
+
+We then merged both sets of data (i.e. subsidies proportions and fleet proportions) and pivoted the data:
+
+```{r}
+#Merge with data
+merge_proportions <- function(df1, df2, group1, group2){
+  df1 %>%
+    full_join(df2, by = c(group1, group2)) %>%
+    replace(is.na(.), 0) %>%
+    transmute(category = category,
+              category_group = category_group,
+              subsidies_number = subsidies_number,
+              subsidies_length = subsidies_length/10^3,
+              subsidies_tonnage = subsidies_tonnage/10^3,
+              subsidies_power = subsidies_power/10^3,
+              subsidies_value = subsidies_value/10^6,
+              dev_number = (subsidies_number_percent / fleet_number_percent) - 1,
+              dev_length = (subsidies_length_percent / fleet_length_percent) - 1,
+              dev_tonnage = (subsidies_tonnage_percent / fleet_tonnage_percent) - 1,
+              dev_power = (subsidies_power_percent / fleet_power_percent) - 1,
+              dev_value_number = (subsidies_value_percent / fleet_number_percent) - 1,
+              dev_value_length = (subsidies_value_percent / fleet_length_percent) - 1,
+              dev_value_tonnage = (subsidies_value_percent / fleet_tonnage_percent) - 1,
+              dev_value_power = (subsidies_value_percent / fleet_power_percent) - 1) %>%
+    pivot_longer(cols = c(3:ncol(.)),
+                 names_to = "type",
+                 values_to = "value") %>%
+    mutate(unit = ifelse(grepl("value", type), "In value (million EUR)", 
+                         ifelse(grepl("length", type), "In total length (thousand m)",
+                                ifelse(grepl("tonnage", type), "In total tonnage (thousand GT)",
+                                       ifelse(grepl("power", type), "In total power (thousand kW)", "In number of files")))))
+}
+#Apply function
+funding_vs_fleet_gear <- merge_proportions(funding_vs_fleet_gear, covid_fleet_gear, "category", "category_group")
+funding_vs_fleet_class_length <- merge_proportions(funding_vs_fleet_class_length, covid_fleet_class_length, "category", "category_group")
+```
+
+Finally, we prepared the data for plotting:
+
+```{r}
+#Create function to prepare deviation data
+deviation <- function(data){
+  data %>%
+  mutate(type = ifelse(grepl("subsidies", type), "subsidies", "deviation")) %>%
+  pivot_wider(names_from = type, 
+              values_from = value)
+}
+
+#Apply function and create final datasets for plotting deviation for different parameters, by gear and length class
+funding_vs_fleet_number <- deviation(funding_vs_fleet_gear %>%
+                                       filter(grepl("_number$", type) | grepl("_value$", type))) %>% 
+  mutate(category_group = factor(category_group, levels = c("Passive gears", "Active gears", "Undet.")),
+         category = factor(category, levels = funding_vs_fleet_gear %>% filter(type == "dev_number" & unit == "In number of files") %>% arrange(value) %>% select(category) %>% pull()),
+         group = "By fishing gear") %>%
+  bind_rows(deviation(funding_vs_fleet_class_length %>%
+                        filter(grepl("_number$", type) | grepl("_value$", type))) %>%
+              mutate(group = "By length class",
+                     category = factor(category, levels = c("<10 m", "10-12 m", "12-25 m", "25-40 m", ">40 m")),
+                     category_group = NA) %>%
+              arrange(category))
+
+funding_vs_fleet_length <- deviation(funding_vs_fleet_gear %>%
+                                       filter(grepl("_length$", type) | grepl("_value$", type))) %>% 
+  mutate(category_group = factor(category_group, levels = c("Passive gears", "Active gears", "Undet.")),
+         category = factor(category, levels = funding_vs_fleet_gear %>% filter(type == "dev_length" & unit == "In total length (thousand m)") %>% arrange(value) %>% select(category) %>% pull()),
+         group = "By fishing gear") %>%
+  bind_rows(deviation(funding_vs_fleet_class_length %>%
+                        filter(grepl("_length$", type) | grepl("_value$", type))) %>%
+              mutate(group = "By length class",
+                     category = factor(category, levels = c("<10 m", "10-12 m", "12-25 m", "25-40 m", ">40 m")),
+                     category_group = NA) %>%
+              arrange(category))
+  
+funding_vs_fleet_tonnage <- deviation(funding_vs_fleet_gear %>%
+                                       filter(grepl("_tonnage$", type) | grepl("_value$", type))) %>% 
+  mutate(category_group = factor(category_group, levels = c("Passive gears", "Active gears", "Undet.")),
+         category = factor(category, levels = funding_vs_fleet_gear %>% filter(type == "dev_tonnage" & unit == "In total tonnage (thousand GT)") %>% arrange(value) %>% select(category) %>% pull()),
+         group = "By fishing gear") %>%
+  bind_rows(deviation(funding_vs_fleet_class_length %>%
+                        filter(grepl("tonnage$", type) | grepl("_value$", type))) %>%
+              mutate(group = "By length class",
+                     category = factor(category, levels = c("<10 m", "10-12 m", "12-25 m", "25-40 m", ">40 m")),
+                     category_group = NA) %>%
+              arrange(category))
+  
+funding_vs_fleet_power <- deviation(funding_vs_fleet_gear %>%
+                                       filter(grepl("power$", type) | grepl("_value$", type))) %>% 
+  mutate(category_group = factor(category_group, levels = c("Passive gears", "Active gears", "Undet.")),
+         category = factor(category, levels = funding_vs_fleet_gear %>% filter(type == "dev_power" & unit == "In total power (thousand kW)") %>% arrange(value) %>% select(category) %>% pull()),
+         group = "By fishing gear") %>%
+  bind_rows(deviation(funding_vs_fleet_class_length %>%
+                        filter(grepl("power$", type) | grepl("_value$", type))) %>%
+              mutate(group = "By length class",
+                     category = factor(category, levels = c("<10 m", "10-12 m", "12-25 m", "25-40 m", ">40 m")),
+                     category_group = NA) %>%
+              arrange(category))
+```
+
+### Plotting the data
+
+The table below shows a summary of the French fleet in terms of fishing gear and length class, compared to the allocation of the COVID fund (in terms of number of files processed and subsidies allocated), from which we derived the 'deviation' indicator plotted below: 
+
+```{r, echo = FALSE}
+options(knitr.kable.NA = "")
+distribution_table <- function(df1, df2, df3, df4){
+  df1 %>%
+    left_join(df2, by = c("category", "category_group")) %>%
+    rename(Category = category) %>%
+    bind_rows(df3 %>%
+                left_join(df4, by = "category") %>%
+                rename(Category = category)) %>%
+    arrange(category_group, desc(fleet_number))
+}
+format_table <- function(data){
+  data %>%
+    kbl() %>%
+    kable_paper(full_width = TRUE) %>%
+    kable_styling(bootstrap_options = c("striped", "condensed", "responsive", "hover")) %>%
+    row_spec(0, bold = TRUE) %>%
+    add_header_above(c(" " = 2, "Allocation of COVID fund" = 2)) %>%
+    pack_rows("Fishing gear", 1, nrow(funding_vs_fleet_gear_for_table)) %>%
+    pack_rows("Length class", nrow(funding_vs_fleet_gear_for_table) + 1, nrow(funding_vs_fleet_gear_for_table) + nrow(funding_vs_fleet_class_length_for_table)) %>%
+    footnote(symbol = "Note that a few marginal categories such as 'free diving' were not subsidized at all, hence their absence in the list and the sum of percentages slightly lower than 100%.")
+}
+
+number_table <- distribution_table(funding_vs_fleet_gear_for_table, covid_fleet_gear, funding_vs_fleet_class_length_for_table, covid_fleet_class_length) %>%
+  mutate(`Vessels in French fleet*` = paste(format(fleet_number, big.mark = " "), " (", round(fleet_number_percent * 100, 1), " %)", sep = ""),
+         `Files processed` = paste(format(subsidies_number, big.mark = " "), " (", round(subsidies_number_percent * 100, 1), " %)", sep = ""),
+         `Subsidies (EUR)` = paste(format(round(subsidies_value, 0), big.mark = " "), " (", round(subsidies_value_percent * 100, 1), " %)", sep = ""))
+format_table(number_table %>%
+               select(Category, `Vessels in French fleet*`, `Files processed`, `Subsidies (EUR)`))
+```
+
+```{r, echo = FALSE}
+# Create plot function
+comparison_plot <- function(input, fill_min, fill_max, y_max){
+  ggplot(data = input,
+         aes(x = category,
+             y = subsidies,
+             fill = deviation))  +  
+    geom_bar(stat = "identity",
+             color = "black",
+             size = 0.1) +
+    geom_text(data = input %>% filter(deviation < 4),
+              aes(label = ifelse(deviation < 0, 
+                                 paste(round(deviation * 100, 1), " %", sep = ""), 
+                                 paste("+", round(deviation * 100, 1), " %", sep = "")),
+                  y = ifelse(subsidies == 0, 
+                             0.05 * y_max, 
+                             ifelse(subsidies < 0.25 * y_max,
+                                    1.05 * subsidies,
+                                    0.05 * y_max))),
+              size = 2,
+              angle = 90,
+              hjust = 0,
+              color = "black") +
+    geom_text(data = input %>% filter(deviation > 4),
+              aes(label = ifelse(deviation < 0, 
+                                 paste(round(deviation * 100, 1), " %", sep = ""), 
+                                 paste("+", round(deviation * 100, 1), " %", sep = "")),
+                  y = ifelse(subsidies == 0, 
+                             0.05 * y_max, 
+                             ifelse(subsidies < 0.3 * y_max,
+                                    1.05 * subsidies,
+                                    0.05 * y_max))),
+              size = 2,
+              angle = 90,
+              hjust = 0,
+              color = "white") +
+    scale_fill_continuous_divergingx(palette = "RdBu", 
+                                     mid = 0,
+                                     rev = TRUE,
+                                     limits = c(fill_min, fill_max),
+                                     l3 = 0,
+                                     p3 = 0.2,
+                                     p4 = 0.2,
+                                     labels = percent) +
+    plot_theme %+% theme(axis.text.x = element_blank(),
+                         strip.placement = "outside",
+                         strip.text.x = element_text(color = "white"),
+                         panel.grid.major.y =  element_blank()) +
+    scale_y_continuous(expand = c(0, 0), 
+                       labels = number_format(accuracy = 1, 
+                                              big.mark = " ", 
+                                              decimal.mark = "."),
+                       limits = c(0, 
+                                  1.05 * y_max))
+}
+
+# Calculate common parameters
+fill_min <- bind_rows(funding_vs_fleet_number, funding_vs_fleet_length, funding_vs_fleet_tonnage, funding_vs_fleet_power) %>% filter(!category == "Undet.") %>% summarise(deviation = min(deviation)) %>% pull()
+fill_max <- bind_rows(funding_vs_fleet_number, funding_vs_fleet_length, funding_vs_fleet_tonnage, funding_vs_fleet_power) %>% filter(!category == "Undet.") %>% summarise(deviation = max(deviation)) %>% pull()
+
+# Number
+## Plot A
+input <- funding_vs_fleet_number %>% filter(unit == "In number of files" & !category == "Undet." & group == "By fishing gear")
+y_max <- funding_vs_fleet_number %>% filter(unit == "In number of files" & !category == "Undet.") %>% summarise(subsidies = max(subsidies)) %>% pull()
+  
+plot_a <- function(data){
+  data +
+    facet_grid( ~ category_group,
+                scales = "free",
+                space = "free",
+                switch = "both") +
+    theme(legend.position = c(0.4, 0.7),
+          legend.key.width = unit(0.5, "cm")) +
+    guides(fill = guide_colorbar(title.position = "top",
+                                 direction = "horizontal",
+                                 barwidth = 7))
+}
+
+a <- plot_a(comparison_plot(input, fill_min, fill_max, y_max)) +
+  labs(x = NULL, y = "In number of files", fill = "Deviation")
+
+## Plot B
+input <- funding_vs_fleet_number %>% filter(unit == "In number of files" & group == "By length class")
+
+plot_b <- function(data){
+  data +
+    plot_theme %+% theme(axis.text.x = element_blank(),
+                         axis.text.y = element_blank(),
+                         panel.grid.major.y = element_blank(),
+                         plot.margin = unit(c(0, 3, 4.25, 0), "mm")) +
+  labs(x = NULL, y = NULL)
+}
+
+b <- plot_b(comparison_plot(input, fill_min, fill_max, y_max))
+
+## Plot C
+input <- funding_vs_fleet_number %>% filter(unit == "In value (million EUR)" & !category == "Undet." & group == "By fishing gear")
+y_max <- funding_vs_fleet_number %>% filter(unit == "In value (million EUR)" & !category == "Undet.") %>% summarise(subsidies = max(subsidies)) %>% pull()
+  
+plot_c <- function(data){
+  data +
+    facet_grid( ~ category_group,
+                scales = "free",
+                space = "free",
+                switch = "both") +
+    labs(x = NULL, y = "In value (million EUR)") +
+    geom_segment(data = input %>% filter(category_group == "Passive gears"),
+                 aes(x = 0.5, 
+                     xend = 7.5, 
+                     y = 4,  
+                     yend = 4),
+                 size = 0.1) +
+    geom_label(data = input %>% filter(category_group == "Passive gears"),
+               aes(x = 3.5, 
+                   y = 4, 
+                   label = "Passive gears"), 
+               fill = NA, 
+               size = 2, 
+               vjust = -0.5, 
+               label.size = NA) +
+    facet_grid( ~ category_group,
+                scales = "free",
+                space = "free",
+                switch = "both") +
+    plot_theme %+% theme(axis.text.x = element_text(angle = 45,
+                                                    hjust = 1),
+                         axis.text.y = element_text(margin = margin(0, 0, 0, 9)),
+                         strip.text.x = element_blank(),
+                         panel.grid.major.y =  element_blank()) +
+  labs(x = NULL, y = "In value (million EUR)")
+}
+
+c <- plot_c(comparison_plot(input, fill_min, fill_max, y_max))
+
+## Plot D
+input <- funding_vs_fleet_number %>% filter(unit == "In value (million EUR)" & group == "By length class")
+
+plot_d <- function(data){
+  data +
+    plot_theme %+% theme(axis.text.x = element_text(angle = 45,
+                                                    hjust = 1),
+                         axis.text.y = element_blank(),
+                         panel.grid.major.y =  element_blank(),
+                         plot.margin = unit(c(0, 3, 11.7, 0), "mm")) +
+  labs(x = NULL, y = NULL)
+}
+
+d <- plot_d(comparison_plot(input, fill_min, fill_max, y_max))
+
+# Put the figure together
+funding_vs_fleet_fig <- annotate_figure(ggarrange(a, b, c, d,
+                                                  nrow = 2,
+                                                  ncol = 2,
+                                                  labels = c("A", "B", "C", "D"),
+                                                  widths = c(1, 0.45),
+                                                  heights = c(0.8, 1.2),
+                                                  label.x = c(0.12, 0.05)),
+                                        left = text_grob("                       Subsidization by segment and deviation from distribution in fleet", 
+                                                         rot = 90,
+                                                         size = 8,
+                                                         face = "bold"))
+ggsave(funding_vs_fleet_fig, file = "Output/Figures/Funding vs fleet_number.png", width = 114, height = 114, unit = "mm")
+funding_vs_fleet_fig
+```
+
+### Summarizing the data
+
+```{r, echo = FALSE}
+stats_table <- funding_vs_fleet_gear_for_table %>% 
+  group_by(category_group) %>% 
+  summarise(subsidies_number = sum(subsidies_number), 
+            subsidies_value = sum(subsidies_value)) %>% 
+  ungroup() %>% 
+  mutate(subsidies_number_percent = round((subsidies_number/sum(subsidies_number))*100, 1), 
+         subsidies_value_percent = round((subsidies_value/sum(subsidies_value)) *100, 1),
+         subsidies_value = round((subsidies_value/10^6), 1))
+```
+
+As summarized in the table above, active gears accounted for `r stats_table %>% filter(category_group == "Active gears") %>% select(subsidies_number_percent) %>% pull()` % (`r stats_table %>% filter(category_group == "Active gears") %>% select(subsidies_number) %>% pull()` records) and `r stats_table %>% filter(category_group == "Active gears") %>% select(subsidies_value_percent) %>% pull()` % (`r stats_table %>% filter(category_group == "Active gears") %>% select(subsidies_value) %>% pull()` million EUR) of subsidies, in number and value, respectively, although they only account for `r covid_fleet_gear %>% group_by(category_group) %>% summarise(fleet_number_percent = round(sum(fleet_number_percent) * 100, 1)) %>% filter(category_group == "Active gears") %>% select(fleet_number_percent) %>% pull()` % of the French fleet (`r format(covid_fleet_gear %>% group_by(category_group) %>% summarise(fleet_number = sum(fleet_number)) %>% filter(category_group == "Active gears") %>% select(fleet_number) %>% pull(), big.mark = " ")` vessels). On their own, bottom trawls & dredges accounted for `r round(funding_vs_fleet_gear_for_table %>% filter(category == "Bottom trawls & dredges") %>% select(subsidies_number_percent) %>% pull() * 100, 1)` % of the subsidies (`r funding_vs_fleet_gear_for_table %>% filter(category == "Bottom trawls & dredges") %>% select(subsidies_number) %>% pull()` files), and captured `r round(funding_vs_fleet_gear_for_table %>% filter(category == "Bottom trawls & dredges") %>% select(subsidies_value_percent) %>% pull() * 100, 1)` % of their amount. In contrast, passive gears only accounted for `r stats_table %>% filter(category_group == "Passive gears") %>% select(subsidies_number_percent) %>% pull()` % (`r stats_table %>% filter(category_group == "Passive gears") %>% select(subsidies_number) %>% pull()` records) and `r stats_table %>% filter(category_group == "Passive gears") %>% select(subsidies_value_percent) %>% pull()` % (`r stats_table %>% filter(category_group == "Passive gears") %>% select(subsidies_value) %>% pull()` million EUR) of subsidies, in number and value, respectively, although they account for `r covid_fleet_gear %>% group_by(category_group) %>% summarise(fleet_number_percent = round(sum(fleet_number_percent) * 100, 1)) %>% filter(category_group == "Passive gears") %>% select(fleet_number_percent) %>% pull()` % of the French fleet.
+In line with these results for passive vs. active gears, vessels smaller than 10 m only accounted for `r round(funding_vs_fleet_class_length_for_table %>% filter(category == "<10 m") %>% select(subsidies_number_percent) %>% pull() * 100, 1)` % (`r funding_vs_fleet_class_length_for_table %>% filter(category == "<10 m") %>% select(subsidies_number) %>% pull()` records) and `r round(funding_vs_fleet_class_length_for_table %>% filter(category == "<10 m") %>% select(subsidies_value_percent) %>% pull() * 100, 1)` % (`r format(round(funding_vs_fleet_class_length_for_table %>% filter(category == "<10 m") %>% select(subsidies_value) %>% pull(), 0), big.mark = " ")` EUR) of the subsidies, in number and value, respectively, although they account for `r covid_fleet_class_length %>% group_by(category) %>% summarise(fleet_number_percent = round(sum(fleet_number_percent) * 100, 1)) %>% filter(category == "<10 m") %>% select(fleet_number_percent) %>% pull()` % of the French fleet. In contrast, a few large vessels received substantial subsidies: the `r funding_vs_fleet_class_length_for_table %>% filter(category == ">40 m") %>% select(subsidies_number) %>% pull()` vessels belonging to the >40 m class (overall accounting for `r round(covid_fleet_class_length %>% filter(category == ">40 m") %>% select(fleet_number_percent) %>% pull() * 100, 1)` % of the national fleet) received the equivalent of `r round((funding_vs_fleet_class_length_for_table %>% filter(category == ">40 m") %>% select(subsidies_value) %>% pull() / funding_vs_fleet_class_length_for_table %>% filter(category == "<10 m") %>% select(subsidies_value) %>% pull()) * 100, 1)` % of the amount received by the <10 m class. Adding the `r funding_vs_fleet_class_length_for_table %>% filter(category == "25-40 m") %>% select(subsidies_number) %>% pull()` vessels belonging to the 25-40 m class (overall accounting for `r round(covid_fleet_class_length %>% filter(category == "25-40 m") %>% select(fleet_number_percent) %>% pull() * 100, 1)` % of the fleet), this figure reaches `r round((funding_vs_fleet_class_length_for_table %>% filter(category %in% c(">40 m", "25-40 m")) %>% summarise(subsidies_value = sum(subsidies_value)) %>% select(subsidies_value) %>% pull() / funding_vs_fleet_class_length_for_table %>% filter(category == "<10 m") %>% select(subsidies_value) %>% pull()) * 100, 1)` %.
+
+```{r, echo = FALSE}
+small_scale_coastal <- data %>%
+  mutate(cat = ifelse(gear_type == "Passive gears" & class_length %in% c("<10 m", "10-12 m"), "Small scale, passive gears",
+                      ifelse(gear_type == "Passive gears" & !(class_length %in% c("<10 m", "10-12 m")), "Large scale, passive gears",
+                             ifelse(gear_type == "Active gears" & class_length %in% c("<10 m", "10-12 m"), "Small scale, active gears", "Large scale, active gears")))) %>%
+  group_by(cat) %>%
+  summarise(subsidy_total_number = n(),
+            subsidy_total_value = sum(subsidy_total),
+            .groups = "keep") %>%
+  ungroup() %>%
+  mutate(subsidy_total_number_percent = subsidy_total_number/sum(subsidy_total_number),
+            subsidy_total_value_percent = subsidy_total_value/sum(subsidy_total_value))
+covid_fleet_small_scale_coastal <- covid_fleet %>%
+  mutate(cat = ifelse(gear_type == "Passive gears" & class_length %in% c("<10 m", "10-12 m"), "Small scale, passive gears",
+                      ifelse(gear_type == "Passive gears" & !(class_length %in% c("<10 m", "10-12 m")), "Large scale, passive gears",
+                             ifelse(gear_type == "Active gears" & class_length %in% c("<10 m", "10-12 m"), "Small scale, active gears", "Large scale, active gears")))) %>%
+  group_by(cat) %>%
+  summarise(count = n(),
+            .groups = "keep") %>%
+  ungroup() %>%
+  mutate(count_percent = count/sum(count))
+```
+
+Considering the European definition of 'small-scale, coastal fisheries', i.e. vessels smaller than 12 m and operating 'passive gears' (`r round(covid_fleet_small_scale_coastal %>% filter(cat == "Small scale, passive gears") %>% select(count_percent) %>% pull() * 100, 1)` % of the French fleet), we can combine these results and say that these 'small-scale, coastal fisheries' only benefited from `r round(small_scale_coastal %>% filter(cat == "Small scale, passive gears") %>% select(subsidy_total_value_percent) %>% pull() * 100, 1)` % of the COVID fund, while vessels larger than 12 m and operating 'active gears', i.e. `r round(covid_fleet_small_scale_coastal %>% filter(cat == "Large scale, active gears") %>% select(count_percent) %>% pull() * 100, 1)` % of the French fleet, captured `r round(small_scale_coastal %>% filter(cat == "Large scale, active gears") %>% select(subsidy_total_value_percent) %>% pull() * 100, 1)` % of the COVID fund. The remaining funds, i.e. `r round(small_scale_coastal %>% filter(cat %in% c("Small scale, active gears", "Large scale, passive gears")) %>% select(subsidy_total_value_percent) %>% ungroup() %>% summarise(subsidy_total_value_percent = sum(subsidy_total_value_percent)) %>% pull() * 100, 1)` %, were allocated to either vessels smaller than 12 m but operating 'active' gears (i.e. `r round(covid_fleet_small_scale_coastal %>% filter(cat == "Small scale, active gears") %>% select(count_percent) %>% pull() * 100, 1)` % of the fleet), or to vessels larger than 12 m but operating 'passive' gears (i.e. `r round(covid_fleet_small_scale_coastal %>% filter(cat == "Large scale, passive gears") %>% select(count_percent) %>% pull() * 100, 1)` % of the fleet).
+
+On top of the trends highlighted above, the figure above evidences that the negative deviations, i.e. under-subsidized segments compared to fleet, only occur in the passive gears and <10 m segments, while all other segments showed positive deviations, i.e. they were over-subsidized compared to their occurrence in the fleet. In particular, the most subsidized segment in terms of gear --- i.e. bottom trawls & dredges --- showed deviationq of `r round(funding_vs_fleet_number %>% filter(category == "Bottom trawls & dredges" & unit == "In number of files") %>% select(deviation) %>% pull() * 100, 1)` % and `r round(funding_vs_fleet_number %>% filter(category == "Bottom trawls & dredges" & unit == "In value (million EUR)") %>% select(deviation) %>% pull() * 100, 1)` % in number of files and value, respectively (panels A and C). Similarly, the most subsidized segment in terms of length --- i.e. the 12-25 m segment --- showed deviations of `r round(funding_vs_fleet_number %>% filter(category == "12-25 m" & unit == "In number of files") %>% select(deviation) %>% pull() * 100, 1)` % and `r round(funding_vs_fleet_number %>% filter(category == "12-25 m" & unit == "In value (million EUR)") %>% select(deviation) %>% pull() * 100, 1)` in number of files and value, respectively (panels B and D).
+
+### Plotting the same data using length instead of the number of vessels as a basis for the fleet's distribution
+
+```{r, echo = FALSE}
+options(knitr.kable.NA = "")
+length_table <- distribution_table(funding_vs_fleet_gear_for_table, covid_fleet_gear, funding_vs_fleet_class_length_for_table, covid_fleet_class_length) %>%
+  mutate(`Vessels in French fleet (m)*` = paste(format(round(fleet_length, 0), big.mark = " "), " (", round(fleet_length_percent * 100, 1), " %)", sep = ""),
+         `Files processed (m)` = paste(format(round(subsidies_length,0), big.mark = " "), " (", round(subsidies_length_percent * 100, 1), " %)", sep = ""),
+         `Subsidies (EUR)` = paste(format(round(subsidies_value, 0), big.mark = " "), " (", round(subsidies_value_percent * 100, 1), " %)", sep = ""))
+format_table(length_table %>%
+               select(Category, `Vessels in French fleet (m)*`, `Files processed (m)`, `Subsidies (EUR)`))
+```
+
+```{r, echo = FALSE}
+# Length
+## Plot A
+input <- funding_vs_fleet_length %>% filter(unit == "In total length (thousand m)" & !category == "Undet." & group == "By fishing gear")
+y_max <- funding_vs_fleet_length %>% filter(unit == "In total length (thousand m)" & !category == "Undet.") %>% summarise(subsidies = max(subsidies)) %>% pull()
+
+a <- plot_a(comparison_plot(input, fill_min, fill_max, y_max)) +
+  labs(x = NULL, y = "In total length (thousand m)", fill = "Deviation")
+
+## Plot B
+input <- funding_vs_fleet_length %>% filter(unit == "In total length (thousand m)" & group == "By length class")
+
+b <- plot_b(comparison_plot(input, fill_min, fill_max, y_max))
+
+## Plot C
+input <- funding_vs_fleet_length %>% filter(unit == "In value (million EUR)" & !category == "Undet." & group == "By fishing gear")
+y_max <- funding_vs_fleet_length %>% filter(unit == "In value (million EUR)" & !category == "Undet.") %>% summarise(subsidies = max(subsidies)) %>% pull()
+
+c <- plot_c(comparison_plot(input, fill_min, fill_max, y_max))
+
+## Plot D
+input <- funding_vs_fleet_length %>% filter(unit == "In value (million EUR)" & group == "By length class")
+
+d <- plot_d(comparison_plot(input, fill_min, fill_max, y_max))
+
+# Put the figure together
+annotate_figure(ggarrange(a, b, c, d,
+                          nrow = 2,
+                          ncol = 2,
+                          labels = c("A", "B", "C", "D"),
+                          widths = c(1, 0.45),
+                          heights = c(0.8, 1.2),
+                          label.x = c(0.12, 0.05)),
+                left = text_grob("                       Subsidization by segment and deviation from distribution in fleet", 
+                                 rot = 90,
+                                 size = 8,
+                                 face = "bold"))
+```
+
+### Plotting the same data using tonnage instead of the number of vessels as a basis for the fleet's distribution
+
+```{r, echo = FALSE}
+options(knitr.kable.NA = "")
+tonnage_table <- distribution_table(funding_vs_fleet_gear_for_table, covid_fleet_gear, funding_vs_fleet_class_length_for_table, covid_fleet_class_length) %>%
+  mutate(`Vessels in French fleet (GT)*` = paste(format(round(fleet_tonnage, 0), big.mark = " "), " (", round(fleet_tonnage_percent * 100, 1), " %)", sep = ""),
+         `Files processed (GT)` = paste(format(round(subsidies_tonnage,0), big.mark = " "), " (", round(subsidies_tonnage_percent * 100, 1), " %)", sep = ""),
+         `Subsidies (EUR)` = paste(format(round(subsidies_value, 0), big.mark = " "), " (", round(subsidies_value_percent * 100, 1), " %)", sep = ""))
+format_table(tonnage_table %>%
+               select(Category, `Vessels in French fleet (GT)*`, `Files processed (GT)`, `Subsidies (EUR)`))
+```
+
+```{r, echo = FALSE}
+# Tonnage
+## Plot A
+input <- funding_vs_fleet_tonnage %>% filter(unit == "In total tonnage (thousand GT)" & !category == "Undet." & group == "By fishing gear")
+y_max <- funding_vs_fleet_tonnage %>% filter(unit == "In total tonnage (thousand GT)" & !category == "Undet.") %>% summarise(subsidies = max(subsidies)) %>% pull()
+  
+a <- plot_a(comparison_plot(input, fill_min, fill_max, y_max)) +
+  labs(x = NULL, y = "In total tonnage (thousand GT)", fill = "Deviation")
+
+## Plot B
+input <- funding_vs_fleet_tonnage %>% filter(unit == "In total tonnage (thousand GT)" & group == "By length class")
+
+b <- plot_b(comparison_plot(input, fill_min, fill_max, y_max))
+
+## Plot C
+input <- funding_vs_fleet_tonnage %>% filter(unit == "In value (million EUR)" & !category == "Undet." & group == "By fishing gear")
+y_max <- funding_vs_fleet_tonnage %>% filter(unit == "In value (million EUR)" & !category == "Undet.") %>% summarise(subsidies = max(subsidies)) %>% pull()
+  
+c <- plot_c(comparison_plot(input, fill_min, fill_max, y_max))
+
+## Plot D
+input <- funding_vs_fleet_tonnage %>% filter(unit == "In value (million EUR)" & group == "By length class")
+
+d <- plot_d(comparison_plot(input, fill_min, fill_max, y_max))
+
+# Put the figure together
+annotate_figure(ggarrange(a, b, c, d,
+                          nrow = 2,
+                          ncol = 2,
+                          labels = c("A", "B", "C", "D"),
+                          widths = c(1, 0.45),
+                          heights = c(0.8, 1.2),
+                          label.x = c(0.12, 0.05)),
+                left = text_grob("                       Subsidization by segment and deviation from distribution in fleet", 
+                                 rot = 90,
+                                 size = 8,
+                                 face = "bold"))
+```
+
+### Plotting the same data using power instead of the number of vessels as a basis for the fleet's distribution
+
+```{r, echo = FALSE}
+options(knitr.kable.NA = "")
+power_table <- distribution_table(funding_vs_fleet_gear_for_table, covid_fleet_gear, funding_vs_fleet_class_length_for_table, covid_fleet_class_length) %>%
+  mutate(`Vessels in French fleet (kW)*` = paste(format(round(fleet_power, 0), big.mark = " "), " (", round(fleet_power_percent * 100, 1), " %)", sep = ""),
+         `Files processed (kW)` = paste(format(round(subsidies_power,0), big.mark = " "), " (", round(subsidies_power_percent * 100, 1), " %)", sep = ""),
+         `Subsidies (EUR)` = paste(format(round(subsidies_value, 0), big.mark = " "), " (", round(subsidies_value_percent * 100, 1), " %)", sep = ""))
+format_table(power_table %>%
+               select(Category, `Vessels in French fleet (kW)*`, `Files processed (kW)`, `Subsidies (EUR)`))
+```
+
+```{r, echo = FALSE}
+# Power
+## Plot A
+input <- funding_vs_fleet_power %>% filter(unit == "In total power (thousand kW)" & !category == "Undet." & group == "By fishing gear")
+y_max <- funding_vs_fleet_power %>% filter(unit == "In total power (thousand kW)" & !category == "Undet.") %>% summarise(subsidies = max(subsidies)) %>% pull()
+
+a <- plot_a(comparison_plot(input, fill_min, fill_max, y_max)) +
+  labs(x = NULL, y = "In total tonnage (thousand GT)", fill = "Deviation")
+
+## Plot B
+input <- funding_vs_fleet_power %>% filter(unit == "In total power (thousand kW)" & group == "By length class")
+
+b <- plot_b(comparison_plot(input, fill_min, fill_max, y_max))
+
+## Plot C
+input <- funding_vs_fleet_power %>% filter(unit == "In value (million EUR)" & !category == "Undet." & group == "By fishing gear")
+y_max <- funding_vs_fleet_power %>% filter(unit == "In value (million EUR)" & !category == "Undet.") %>% summarise(subsidies = max(subsidies)) %>% pull()
+
+c <- plot_c(comparison_plot(input, fill_min, fill_max, y_max))
+
+## Plot D
+input <- funding_vs_fleet_power %>% filter(unit == "In value (million EUR)" & group == "By length class")
+
+d <- plot_d(comparison_plot(input, fill_min, fill_max, y_max))
+
+# Put the figure together
+annotate_figure(ggarrange(a, b, c, d,
+                          nrow = 2,
+                          ncol = 2,
+                          labels = c("A", "B", "C", "D"),
+                          widths = c(1, 0.45),
+                          heights = c(0.8, 1.2),
+                          label.x = c(0.12, 0.05)),
+                left = text_grob("                       Subsidization by segment and deviation from distribution in fleet", 
+                                 rot = 90,
+                                 size = 8,
+                                 face = "bold"))
+```
+
+## Larger vessels proportionately received more subsidies
+
+### Preparing the data
+
+The first step consisted in identifying outliers using Cook's distance (i.e. statistical individuals that significantly impact the regression):
+
+```{r}
+data_ratio <- data %>%
+  mutate(#Calculate ratio of subsidies per unit of length/tonnage/power
+    ratio_length = subsidy_total/length,
+    ratio_tonnage = subsidy_total/tonnage,
+    ratio_power = subsidy_total/power)
+outliers <- data_ratio %>%
+  mutate(#Determine outliers with Cook's distance
+    id = 1:n(),
+    cooks_distance_length = cooks.distance(lm(subsidy_total ~ length)),
+    cooks_distance_tonnage = cooks.distance(lm(subsidy_total ~ tonnage)),
+    cooks_distance_power = cooks.distance(lm(subsidy_total ~ power))) %>%
+  select(id, vessel_name, length, cooks_distance_length, cooks_distance_tonnage, cooks_distance_power) %>%
+  pivot_longer(cols = c(4:ncol(.)),
+               names_to = "type",
+               values_to = "value") %>%
+  mutate(type = ifelse(grepl("length", type), "Length",
+                       ifelse(grepl("tonnage", type), "Tonnage", "Power")))
+outliers_vessels <- outliers %>%
+  filter(value > 0.5) %>%
+  select(vessel_name, length) %>%
+  distinct() %>%
+  arrange(length)
+```
+
+Using thresholds of 0.5 and 1, the same `r nrow(outliers_vessels)` vessels consistently showed up as outliers for `length`, `tonnage`, and `power`: `r outliers_vessels %>% filter(row_number() == 1) %>% mutate(vessel = paste(vessel_name, " (", length, " m)", sep = "")) %>% select(vessel) %>% pull()`, `r outliers_vessels %>% filter(row_number() == 2) %>% mutate(vessel = paste(vessel_name, " (", length, " m)", sep = "")) %>% select(vessel) %>% pull()`, and `r outliers_vessels %>% filter(row_number() == 3) %>% mutate(vessel = paste(vessel_name, " (", length, " m)", sep = "")) %>% select(vessel) %>% pull()` (not for `length`, just below the 0.5 threshold).
+
+```{r, echo = FALSE}
+ggplot(data = outliers %>%
+         mutate(color = ifelse(value >= 0.5, "red", "grey80"),
+                label = ifelse(value >= 0.5, paste(vessel_name, " (", length, " m)", sep = ""), NA)),
+       aes(x = id,
+           y = value,
+           color = color,
+           label = label)) +
+  geom_bar(stat = "identity") +
+  geom_point() +
+  geom_text_repel(na.rm = TRUE,
+                  force = 2,
+                  nudge_y = 0.1,
+                  color = "black",
+                  size = 2) +
+  geom_hline(yintercept = c(0.5, 1), 
+             linetype = "dotted", 
+             size = 0.5) +
+  facet_wrap(~type) +
+  scale_colour_identity() +
+  plot_theme %+% theme(panel.grid.major.y = element_blank()) +
+  labs(x = NULL, y = "Cook's distance") +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, 1.05 * max(outliers$value)))
+```
+
+We identified these `r nrow(outliers_vessels)` vessels as outliers for the following analysis:
+
+```{r}
+data_ratio <- data_ratio %>%
+  mutate(outlier = ifelse(!vessel_name %in% c("KLONDYKE", "DOLOMIEU") & !(vessel_name == "CAP NORD" & length == 54.30), "No", "Yes")) #There are two different 'CAP NORD'
+```
+
+Finally, we pivoted our data into longer format for plotting, and created an additional `box` column in order to create a boxplot of each class:
+
+```{r}
+data_ratio <- bind_rows(data_ratio %>%
+                          select(length, class_length, outlier, subsidy_total, ratio_length) %>%
+                          gather(key = "type", value = "subsidy", c(4:5)) %>%
+                          mutate(type = ifelse(type == "subsidy_total", "Subsidy per vessel (EUR)", "Subsidy per meter (EUR)"),
+                                 type = factor(type, levels = c("Subsidy per vessel (EUR)", "Subsidy per meter (EUR)"))) %>%
+                          group_by(class_length) %>%
+                          mutate(box = mean(c(min(floor(length)), max(ceiling(length)))),
+                                 category = "Length") %>%
+                          rename(value = length,
+                                 class = class_length), 
+                        data_ratio %>%
+                          select(tonnage, class_tonnage, outlier, subsidy_total, ratio_tonnage) %>%
+                          gather(key = "type", value = "subsidy", c(4:5)) %>%
+                          mutate(type = ifelse(type == "subsidy_total", "Subsidy per vessel (EUR)", "Subsidy per GT (EUR)"),
+                                 type = factor(type, levels = c("Subsidy per vessel (EUR)", "Subsidy per GT (EUR)"))) %>%
+                          group_by(class_tonnage) %>%
+                          mutate(box = mean(c(min(floor(tonnage)), max(ceiling(tonnage)))),
+                                 category = "Tonnage") %>%
+                          rename(value = tonnage,
+                                 class = class_tonnage), 
+                        data_ratio %>%
+                          select(power, class_power, outlier, subsidy_total, ratio_power) %>%
+                          gather(key = "type", value = "subsidy", c(4:5)) %>%
+                          mutate(type = ifelse(type == "subsidy_total", "Subsidy per vessel (EUR)", "Subsidy per kW (EUR)"),
+                                 type = factor(type, levels = c("Subsidy per vessel (EUR)", "Subsidy per kW (EUR)"))) %>%
+                          group_by(class_power) %>%
+                          mutate(box = mean(c(min(floor(power)), max(ceiling(power)))),
+                                 category = "Power") %>%
+                          rename(value = power,
+                                 class = class_power))
+```
+
+### Plotting the data
+
+We then plotted the data, which shows in A) the amount of subsidy received per vessel as a function of the vessel length, and in B) the ratio of the amount of subsidy received per meter ($EUR·m^{-1}$), as a function of the vessel’s length. Both $R^2$ and $p$ values are provided for the linear regression (red line; 95% standard error in transparency); a ‘locally weighted smoothing’ (loess) regression is also provided (dashed blue line; degree = 1 and default span of 0.75). Boxplots are also displayed for four length class (i.e. ‘<10 m’, ‘10-12 m’, ‘12–25 m’, and ‘25–40 m’) and as a means of providing additional information.
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+#Create plotting function
+ratio_plot_a <- function(df1, df2, df3, x1, y1, x2, y2){
+  ggplot() +
+  geom_point(data = df1,
+             aes(x = value, 
+                 y = subsidy),
+             shape = 21,
+             stroke = 0,
+             size = 0.75,
+             fill = "grey80") +
+  geom_point(data = df2,
+             aes(x = value, 
+                 y = subsidy),
+             shape = 4,
+             size = 0.5,
+             color = "red") +
+  geom_point(data = df3,
+             aes(x = value, 
+                 y = subsidy),
+             shape = 21,
+             stroke = 0.2,
+             color = "black") +
+  geom_segment(aes(x = 0, 
+                   xend = x1, 
+                   y = y1,  
+                   yend = y1),
+               size = 0.25) +
+  geom_segment(aes(x = x1, 
+                   xend = x1, 
+                   y = 0,  
+                   yend = y1),
+               size = 0.25) +
+  geom_label(aes(x = 0, 
+                 y = 0.85 * y1, 
+                 label = "B-C focus"), 
+             fill = NA, 
+             size = 2.5, 
+             hjust = -0.05, 
+             fontface = "italic",
+             label.size = NA) +
+  plot_theme %+% theme(plot.margin = unit(c(0, 3, 1, 0), "mm"),
+                       panel.grid.major.y =  element_blank(),
+                       axis.ticks.x = element_blank(),
+                       axis.text.x = element_blank()) +
+  scale_x_continuous(expand = c(0, 0), 
+                     limits = c(0, 1.05 * x2)) +
+  scale_y_continuous(expand = c(0, 0), 
+                     limits = c(0, 1.05 * y2),
+                     labels = number_format(accuracy = 1, 
+                                            big.mark = " ", 
+                                            decimal.mark = ".")) +
+  labs(y = "Subsidy per vessel (EUR)",
+       x = NULL)
+}
+a <- ratio_plot_a(data_ratio %>% filter(type == "Subsidy per vessel (EUR)" & outlier == "No" & category == "Length"),
+                  data_ratio %>% filter(type == "Subsidy per vessel (EUR)" & outlier == "Yes" & category == "Length"),
+                  data_ratio %>% ungroup() %>% filter(type == "Subsidy per vessel (EUR)" & category == "Length") %>% arrange(subsidy) %>% filter(row_number() == 1 | row_number() == n()),
+                  round(data_ratio %>% ungroup() %>% filter(outlier == "No" & category == "Length") %>% summarise(value = max(value)) %>% pull(), 0),
+                  round(data_ratio %>% ungroup() %>% filter(outlier == "No" & category == "Length") %>% summarise(subsidy = max(subsidy)) %>% pull(), 0),
+                  ceiling(data_ratio %>% filter(category == "Length") %>% ungroup() %>% summarise(value = max(value)) %>% pull()),
+                  ceiling(data_ratio %>% filter(category == "Length") %>% ungroup() %>% summarise(subsidy = max(subsidy)) %>% pull()))
+
+ratio_plot_b <- function(df1, x1){
+  b_c <- ggplot(data = df1,
+                aes(x = value, 
+                    y = subsidy)) +
+    geom_point(shape = 21,
+               stroke = 0,
+               size = 0.75,
+               fill = "grey80") +
+    geom_smooth(color = "blue",
+                se = FALSE,
+                size = 0.25,
+                linetype = "dashed",
+                method = loess,
+                formula = y ~ x,
+                method.args = list(degree = 1)) +
+    geom_smooth(color = "red",
+                fill = "red",
+                size = 0.25,
+                method = lm,
+                formula = y ~ x) +
+    geom_boxplot(aes(x = box,
+                     y = subsidy,
+                     group = box),
+                 color = "grey50",
+                 fill = NA,
+                 size = 0.15,
+                 width = 0.2,
+                 outlier.fill = NA,
+                 outlier.color = NA) +
+    geom_hline(yintercept = 0, 
+               color = "black", 
+               size = 0.25) +
+    plot_theme %+% theme(plot.margin = unit(c(0, 3, 1, 0), "mm"),
+                         strip.placement = "outside",
+                         strip.text.y = element_text(margin = margin(0, 3, 0, 0)),
+                         panel.grid.major.y =  element_blank()) +
+    scale_x_continuous(expand = c(0, 0), 
+                       limits = c(0, x1)) +
+    scale_y_continuous(expand = c(0, 0), 
+                       limits = c(0, NA),
+                       labels = number_format(accuracy = 1, 
+                                              big.mark = " ", 
+                                              decimal.mark = ".")) +
+    stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")), 
+             label.x = -Inf, 
+             label.y = Inf,
+             hjust = -0.2,
+             vjust = 5,
+             size = 2) +
+    facet_grid(type ~ .,
+               scales = "free_y",
+               switch = "y")
+  b_c <- tag_facet(b_c,
+                   x = -Inf, 
+                   y = Inf, 
+                   open = "", 
+                   close = "",
+                   tag_pool = c("B", "C"))
+}
+
+b_c <- ratio_plot_b(data_ratio %>% filter(outlier == "No" & category == "Length"),
+                    ceiling(data_ratio %>% ungroup() %>% filter(outlier == "No" & category == "Length") %>% summarise(value = max(value)) %>% pull())) +
+  labs(x = "Vessel length (m)", 
+       y = NULL)
+
+covid_funding_by_length_fig <- ggarrange(a, b_c, 
+                                         ncol = 1,
+                                         heights = c(0.35, 0.65),
+                                         align = "hv",
+                                         labels = c("A", ""),
+                                         hjust = -4.5,
+                                         font.label = list(size = 12))
+ggsave(covid_funding_by_length_fig, file = "Output/Figures/Funding ratio by length.png", width = 87, height = 140, unit = "mm")
+covid_funding_by_length_fig
+```
+
+### Summarizing the data
+
+The smallest subsidy (i.e. `r format(round(data_ratio %>% ungroup() %>% filter(type == "Subsidy per vessel (EUR)" & category == "Length") %>% summarise(subsidy = min(subsidy)) %>% pull(), 0), big.mark = " ")` EUR) was allocated to a `r data_ratio %>% ungroup() %>% filter(type == "Subsidy per vessel (EUR)" & category == "Length") %>% arrange(subsidy) %>% slice(1) %>% select(value) %>% pull()` m vessel. In contrast, the largest subsidy (i.e. `r format(round(data_ratio %>% ungroup() %>% filter(type == "Subsidy per vessel (EUR)" & category == "Length") %>% summarise(subsidy = max(subsidy)) %>% pull(), 0), big.mark = " ")` EUR) was allocated to the largest vessel concerned, with `r data_ratio %>% ungroup() %>% filter(type == "Subsidy per vessel (EUR)" & category == "Length") %>% arrange(desc(subsidy)) %>% slice(1) %>% select(value) %>% pull()` m. Outliers excluded (panels B and C), vessels of the ‘<10 m’ class received a median subsidy of `r format(round(data_ratio %>% filter(class == "<10 m" & type == "Subsidy per vessel (EUR)" & outlier == "No") %>% summarise(subsidy = median(subsidy)) %>% pull(), 0), big.mark = " ")` EUR, while vessels between 12 and 25 m received `r format(round(data_ratio %>% filter(class == "12-25 m" & type == "Subsidy per vessel (EUR)" & outlier == "No") %>% summarise(subsidy = median(subsidy)) %>% pull(), 0), big.mark = " ")` EUR and vessels between 25 and 40 m received `r format(round(data_ratio %>% filter(class == "25-40 m" & type == "Subsidy per vessel (EUR)" & outlier == "No") %>% summarise(subsidy = median(subsidy)) %>% pull(), 0), big.mark = " ")` EUR (panel B). However, this increase was not regular, as panel C shows that the ratio of the subsidy received per meter also increased with the length of the vessel: while the smallest vessels below 10 m received a median of `r format(round(data_ratio %>% filter(class == "<10 m" & type == "Subsidy per meter (EUR)" & outlier == "No") %>% summarise(subsidy = median(subsidy)) %>% pull(), 0), big.mark = " ")` EUR per meter, the 12–25 m class received `r format(round(data_ratio %>% filter(class == "12-25 m" & type == "Subsidy per meter (EUR)" & outlier == "No") %>% summarise(subsidy = median(subsidy)) %>% pull(), 0), big.mark = " ")` EUR and the 25-40 m class `r format(round(data_ratio %>% filter(class == "25-40 m" & type == "Subsidy per meter (EUR)" & outlier == "No") %>% summarise(subsidy = median(subsidy)) %>% pull(), 0), big.mark = " ")` EUR.
+
+### Plotting the data in terms of tonnage
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+a <- ratio_plot_a(data_ratio %>% filter(type == "Subsidy per vessel (EUR)" & outlier == "No" & category == "Tonnage"),
+                  data_ratio %>% filter(type == "Subsidy per vessel (EUR)" & outlier == "Yes" & category == "Tonnage"),
+                  data_ratio %>% ungroup() %>% filter(type == "Subsidy per vessel (EUR)" & category == "Tonnage") %>% arrange(subsidy) %>% filter(row_number() == 1 | row_number() == n()),
+                  round(data_ratio %>% ungroup() %>% filter(outlier == "No" & category == "Tonnage") %>% summarise(value = max(value)) %>% pull(), 0),
+                  round(data_ratio %>% ungroup() %>% filter(outlier == "No" & category == "Tonnage") %>% summarise(subsidy = max(subsidy)) %>% pull(), 0),
+                  ceiling(data_ratio %>% filter(category == "Tonnage") %>% ungroup() %>% summarise(value = max(value)) %>% pull()),
+                  ceiling(data_ratio %>% filter(category == "Tonnage") %>% ungroup() %>% summarise(subsidy = max(subsidy)) %>% pull()))
+b_c <- ratio_plot_b(data_ratio %>% filter(outlier == "No" & category == "Tonnage"),
+                    ceiling(data_ratio %>% ungroup() %>% filter(outlier == "No" & category == "Tonnage") %>% summarise(value = max(value)) %>% pull())) +
+  labs(x = "Vessel tonnage (GT)", 
+       y = NULL)
+
+ggarrange(a, b_c, 
+          ncol = 1,
+          heights = c(0.35, 0.65),
+          align = "hv",
+          labels = c("A", ""),
+          hjust = -4.5,
+          font.label = list(size = 12))
+```
+
+### Plotting the data in terms of power
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+a <- ratio_plot_a(data_ratio %>% filter(type == "Subsidy per vessel (EUR)" & outlier == "No" & category == "Power"),
+                  data_ratio %>% filter(type == "Subsidy per vessel (EUR)" & outlier == "Yes" & category == "Power"),
+                  data_ratio %>% ungroup() %>% filter(type == "Subsidy per vessel (EUR)" & category == "Power") %>% arrange(subsidy) %>% filter(row_number() == 1 | row_number() == n()),
+                  round(data_ratio %>% ungroup() %>% filter(outlier == "No" & category == "Power") %>% summarise(value = max(value)) %>% pull(), 0),
+                  round(data_ratio %>% ungroup() %>% filter(outlier == "No" & category == "Power") %>% summarise(subsidy = max(subsidy)) %>% pull(), 0),
+                  ceiling(data_ratio %>% filter(category == "Power") %>% ungroup() %>% summarise(value = max(value)) %>% pull()),
+                  ceiling(data_ratio %>% filter(category == "Power") %>% ungroup() %>% summarise(subsidy = max(subsidy)) %>% pull()))
+b_c <- ratio_plot_b(data_ratio %>% filter(outlier == "No" & category == "Power"),
+                    ceiling(data_ratio %>% ungroup() %>% filter(outlier == "No" & category == "Power") %>% summarise(value = max(value)) %>% pull())) +
+  labs(x = "Vessel power (kW)", 
+       y = NULL)
+
+ggarrange(a, b_c, 
+          ncol = 1,
+          heights = c(0.35, 0.65),
+          align = "hv",
+          labels = c("A", ""),
+          hjust = -4.5,
+          font.label = list(size = 12))
+```
+
+### Side note on length, tonnage, and power
+
+We used the length of the vessels as our basis for our analyses, given that this is the variable also used as a legal basis. However, we also extracted the tonnage (GT) and power (kW) of the concerned vessels, given that these two variables are used at the European level to assess the fishing fleet's capacity (<https://ec.europa.eu/oceans-and-fisheries/fisheries/rules/fishing-fleet-capacities_fr>).
+
+Here, we provide a brief analysis of the relationships between these three variables, for the `covid_fleet` data, i.e. the vessels that were active during the application of the COVID fund.
+
+The distribution of the COVID fleet can be summarized as follows:
+
+```{r, echo = FALSE}
+options(knitr.kable.NA = "")
+covid_fleet %>%
+  select(starts_with("class_")) %>%
+  pivot_longer(cols = c(1:ncol(.)),
+               names_to = "Variable",
+               values_to = "Class") %>%
+  group_by(Variable, Class) %>%
+  summarise(`Number of vessels` = n(),
+            .groups = "keep") %>%
+  arrange(Variable, Class) %>%
+  mutate(Variable = str_remove(Variable, "class_"),
+         Variable = str_to_title(Variable)) %>%
+  kbl() %>%
+  kable_paper(full_width = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed", "responsive", "hover")) %>%
+  row_spec(0, bold = TRUE) %>%
+  collapse_rows(columns = 1:1, valign = "top")
+```
+
+First, the data show distributions that are highly right-skewed --- especially for the `tonnage` variable ---, i.e. the overwhelming majority of vessels are small, either in terms of length (m), tonnage (GT), or power (kW):
+
+```{r, message = FALSE, echo = FALSE, warning = FALSE}
+densities <- covid_fleet %>%
+  select(length, tonnage, power) %>%
+  drop_na %>%
+  pivot_longer(cols = c(1:ncol(.)),
+               names_to = "type",
+               values_to = "value") %>%
+  mutate(type = str_to_title(type),
+         type = ifelse(grepl("Length", type), "Length (m)",
+                       ifelse(grepl("Tonnage", type), "Tonnage (GT)", "Power (kW)")),
+         group = "densities") %>%
+  bind_rows(tibble(type = "Length (m)", value = c(10, 12, 25, 40)) %>%
+              bind_rows(break_tonnage %>% filter(!(row_number() == 1 | row_number() == n())) %>% rename(value = break_tonnage) %>% add_column(type = "Tonnage (GT)")) %>%
+              bind_rows(break_power %>% filter(!(row_number() == 1 | row_number() == n())) %>% rename(value = break_power) %>% add_column(type = "Power (kW)")) %>%
+              mutate(group = "breaks"))
+
+log <- ggplot() + 
+  geom_density(data = densities %>% filter(group == "densities"), 
+               aes(x = value)) + 
+  plot_theme %+% theme(panel.grid.major.y =  element_blank(),
+    strip.placement = "outside") +
+  labs(x = NULL, y = "Density") +
+  scale_x_log10(expand = c(0, 0),
+                labels = scales::number_format()) +
+  scale_y_continuous(expand = c(0, 0)) +
+  facet_wrap(~type,
+             scales = "free",
+             strip.position = "bottom") +
+  geom_vline(data = densities %>% filter(group == "breaks" & type == "Length (m)"),
+             aes(xintercept = value),
+             color = "red",
+             linetype = "dotted") +
+  geom_vline(data = densities %>% filter(group == "breaks" & type == "Tonnage (GT)"),
+             aes(xintercept = value),
+             color = "red",
+             linetype = "dotted") +
+  geom_vline(data = densities %>% filter(group == "breaks" & type == "Power (kW)"), 
+             aes(xintercept = value),
+             color = "red",
+             linetype = "dotted")
+normal <- log +
+  theme(strip.text.x = element_blank()) +
+  scale_x_continuous(expand = c(0, 0),
+                labels = scales::number_format()) +
+  scale_y_continuous(expand = c(0, 0)) +
+  geom_text(data = densities %>% filter(type == "Length (m)"),
+            aes(x = 0.8 * max(densities %>% filter(group == "densities" & type == "Length (m)") %>% select(value)),
+                y = 0,
+                label = densities %>%
+                  filter(group == "breaks" & type == "Length (m)") %>%
+                  select(value) %>%
+                  mutate(value = paste(value, " m", sep = "")) %>%
+                  summarise(seq = paste(value, collapse = "\n"))),
+            color = "red",
+            size = 2,
+            vjust = -0.5,
+            hjust = 0,
+            check_overlap = TRUE,
+            lineheight = 0.8) +
+  geom_text(data = densities %>% filter(type == "Tonnage (GT)"),
+            aes(x = 0.8 * max(densities %>% filter(group == "densities" & type == "Tonnage (GT)") %>% select(value)),
+                y = 0,
+                label = densities %>%
+                  filter(group == "breaks" & type == "Tonnage (GT)") %>%
+                  select(value) %>%
+                  mutate(value = paste(value, " GT", sep = "")) %>%
+                  summarise(seq = paste(value, collapse = "\n"))),
+            color = "red",
+            size = 2,
+            vjust = -0.5,
+            hjust = 0,
+            check_overlap = TRUE,
+            lineheight = 0.8) +
+  geom_text(data = densities %>% filter(type == "Power (kW)"), 
+            aes(x = 0.8 * max(densities %>% filter(group == "densities" & type == "Power (kW)") %>% select(value)),
+                y = 0,
+                label = densities %>% 
+                  filter(group == "breaks" & type == "Power (kW)") %>% 
+                  select(value) %>% 
+                  mutate(value = paste(value, " kW", sep = "")) %>% 
+                  summarise(seq = paste(value, collapse = "\n"))),
+            color = "red",
+            size = 2,
+            vjust = -0.5,
+            hjust = 0,
+            check_overlap = TRUE,
+            lineheight = 0.8) +
+  geom_text(data = densities %>% filter(type == "Length (m)"),
+            aes(x = 0.8 * max(densities %>% filter(group == "densities" & type == "Length (m)") %>% select(value)),
+                y = 0,
+                label = "Breaks"),
+            color = "black",
+            size = 2,
+            vjust = -10,
+            hjust = 0,
+            fontface = "bold",
+            check_overlap = TRUE) +
+  geom_text(data = densities %>% filter(type == "Tonnage (GT)"),
+            aes(x = 0.8 * max(densities %>% filter(group == "densities" & type == "Tonnage (GT)") %>% select(value)),
+                y = 0,
+                label = "Breaks"),
+            color = "black",
+            size = 2,
+            vjust = -10,
+            hjust = 0,
+            fontface = "bold",
+            check_overlap = TRUE) +
+  geom_text(data = densities %>% filter(type == "Power (kW)"), 
+            aes(x = 0.8 * max(densities %>% filter(group == "densities" & type == "Power (kW)") %>% select(value)),
+                y = 0,
+                label = "Breaks"),
+            color = "black",
+            size = 2,
+            vjust = -10,
+            hjust = 0,
+            fontface = "bold",
+            check_overlap = TRUE)
+ggarrange(normal, log,
+          nrow = 2,
+          align = "hv")
+```
+
+The data also show non-linear relationships between these three variables, but strong correlations:
+
+```{r, echo = FALSE}
+relationships <- covid_fleet %>%
+  select(length, tonnage, power) %>%
+  drop_na
+```
+
+```{r, echo = FALSE}
+relationships <- covid_fleet %>%
+  select(length, tonnage, power) %>%
+  drop_na
+relationships_correlation_matrix <- as.data.frame.table(round(cor(relationships), 2))
+ggpairs(relationships)
+```
+
+```{r, echo = FALSE}
+class_change <- covid_fleet %>%
+  mutate_at(vars(contains("class_")), ~as.numeric(.)) %>%
+  mutate(`Change in class` = class_tonnage - class_length) %>%
+  group_by(`Change in class`) %>%
+  summarise(`Number of vessels` = n()) %>%
+  mutate(Variable = "Tonnage") %>%
+  bind_rows(covid_fleet %>%
+              mutate_at(vars(contains("class_")), ~as.numeric(.)) %>%
+              mutate(`Change in class` = class_power - class_length) %>%
+              group_by(`Change in class`) %>%
+              summarise(`Number of vessels` = n()) %>%
+              mutate(Variable = "Power"))
+```
+
+Finally, the data also show that many vessels belong to different classes for the three variables under scrutiny (particularly true for `power`).
+
+```{r, echo = FALSE}
+ggplot(data = class_change,
+       aes(x = `Change in class`,
+           y = `Number of vessels`)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~Variable)
+```
